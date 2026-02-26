@@ -1,0 +1,5 @@
+*.log
+*.txt
+bin
+logs
+data_node*
