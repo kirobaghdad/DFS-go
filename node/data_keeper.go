@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	pb "dfs-go/proto"
@@ -17,8 +20,19 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const (
+	commandUpload       byte = 0x01
+	commandDownload     byte = 0x02
+	commandRangeRequest byte = 0x03
+
+	heartbeatEvery       = 1 * time.Second
+	masterRPCTimeout     = 3 * time.Second
+	supportedMediaSuffix = ".mp4"
+)
+
 type DataKeeper struct {
 	pb.UnimplementedDataKeeperServer
+
 	id      string
 	ip      string
 	tcpPort int32
@@ -28,7 +42,10 @@ type DataKeeper struct {
 
 func NewDataKeeper(id, ip string, tcpPort int32, master pb.MasterTrackerClient) *DataKeeper {
 	baseDir := fmt.Sprintf("data_%s", id)
-	os.MkdirAll(baseDir, 0755)
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		log.Fatalf("failed to create data directory %s: %v", baseDir, err)
+	}
+
 	return &DataKeeper{
 		id:      id,
 		ip:      ip,
@@ -39,245 +56,355 @@ func NewDataKeeper(id, ip string, tcpPort int32, master pb.MasterTrackerClient) 
 }
 
 func (dk *DataKeeper) SendHeartbeat() {
-	// First sync existing files
 	dk.SyncExistingFiles()
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(heartbeatEvery)
+	defer ticker.Stop()
+
 	for range ticker.C {
-		_, err := dk.master.Heartbeat(context.Background(), &pb.HeartbeatRequest{
+		ctx, cancel := context.WithTimeout(context.Background(), masterRPCTimeout)
+		_, err := dk.master.Heartbeat(ctx, &pb.HeartbeatRequest{
 			NodeId: dk.id,
 			Ip:     dk.ip,
 			Port:   dk.tcpPort,
 		})
+		cancel()
 		if err != nil {
-			log.Printf("Failed to send heartbeat: %v", err)
+			log.Printf("Heartbeat to master failed: %v", err)
 		}
 	}
 }
 
 func (dk *DataKeeper) SyncExistingFiles() {
-	files, err := os.ReadDir(dk.baseDir)
+	entries, err := os.ReadDir(dk.baseDir)
 	if err != nil {
-		log.Printf("Failed to read base directory %s: %v", dk.baseDir, err)
+		log.Printf("Failed to scan %s: %v", dk.baseDir, err)
 		return
 	}
 
-	var fileInfos []*pb.FileInfo
-	for _, f := range files {
-		if !f.IsDir() {
-			filePath := filepath.Join(dk.baseDir, f.Name())
-			info, err := os.Stat(filePath)
-			if err != nil {
-				continue
-			}
-			fileInfos = append(fileInfos, &pb.FileInfo{
-				FileName: f.Name(),
-				FileSize: info.Size(),
-				FilePath: filePath,
-			})
+	fileInfos := make([]*pb.FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), supportedMediaSuffix) {
+			continue
 		}
+
+		filePath := filepath.Join(dk.baseDir, entry.Name())
+		info, err := os.Stat(filePath)
+		if err != nil {
+			log.Printf("Skipping %s during startup sync: %v", filePath, err)
+			continue
+		}
+
+		fileInfos = append(fileInfos, &pb.FileInfo{
+			FileName: entry.Name(),
+			FileSize: info.Size(),
+			FilePath: filePath,
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), masterRPCTimeout)
+	defer cancel()
+
+	if _, err := dk.master.ReportFiles(ctx, &pb.ReportFilesRequest{
+		NodeId: dk.id,
+		Files:  fileInfos,
+	}); err != nil {
+		log.Printf("Failed to report local files to master: %v", err)
+		return
 	}
 
 	if len(fileInfos) > 0 {
-		_, err := dk.master.ReportFiles(context.Background(), &pb.ReportFilesRequest{
-			NodeId: dk.id,
-			Files:  fileInfos,
-		})
-		if err != nil {
-			log.Printf("Failed to report existing files to master: %v", err)
-		} else {
-			log.Printf("Synchronized %d existing files with master", len(fileInfos))
-		}
+		log.Printf("Reported %d local file(s) to master", len(fileInfos))
 	}
 }
 
-// StartTCPServer handles direct file transfers from clients and other nodes
 func (dk *DataKeeper) StartTCPServer() {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", dk.tcpPort))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", dk.tcpPort))
 	if err != nil {
-		log.Fatalf("Failed to listen on TCP: %v", err)
+		log.Fatalf("failed to listen on TCP %d: %v", dk.tcpPort, err)
 	}
 	log.Printf("Data Keeper TCP server listening on :%d", dk.tcpPort)
 
 	for {
-		conn, err := lis.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Failed to accept connection: %v", err)
+			log.Printf("TCP accept failed: %v", err)
 			continue
 		}
-		go dk.handleFileTransfer(conn)
+		go dk.handleTCPConnection(conn)
 	}
 }
 
-func (dk *DataKeeper) handleFileTransfer(conn net.Conn) {
+func (dk *DataKeeper) handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
 
-	// Protocol: [COMMAND (1 byte)][NAME_LEN (4 bytes)][NAME][FILE_CONTENT if upload]
-	// COMMAND: 0x01 = UPLOAD, 0x02 = DOWNLOAD
-
-	cmdBuf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, cmdBuf); err != nil {
-		log.Printf("Failed to read command: %v", err)
-		return
-	}
-	cmd := cmdBuf[0]
-
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		log.Printf("Failed to read name length: %v", err)
+	command := make([]byte, 1)
+	if _, err := io.ReadFull(conn, command); err != nil {
+		log.Printf("Failed to read command byte: %v", err)
 		return
 	}
 
-	nameLen := int(uint32(header[0])<<24 | uint32(header[1])<<16 | uint32(header[2])<<8 | uint32(header[3]))
-	nameBuf := make([]byte, nameLen)
-	if _, err := io.ReadFull(conn, nameBuf); err != nil {
-		log.Printf("Failed to read file name: %v", err)
-		return
+	switch command[0] {
+	case commandUpload:
+		uploadID, err := readSizedString(conn)
+		if err != nil {
+			log.Printf("Failed to read upload id: %v", err)
+			return
+		}
+		fileName, err := readSizedString(conn)
+		if err != nil {
+			log.Printf("Failed to read upload file name: %v", err)
+			return
+		}
+		if err := dk.receiveUpload(uploadID, fileName, conn); err != nil {
+			log.Printf("Upload receive failed: %v", err)
+		}
+	case commandDownload:
+		fileName, err := readSizedString(conn)
+		if err != nil {
+			log.Printf("Failed to read download file name: %v", err)
+			return
+		}
+		if err := dk.streamWholeFile(fileName, conn); err != nil {
+			log.Printf("Download serve failed: %v", err)
+		}
+	case commandRangeRequest:
+		fileName, err := readSizedString(conn)
+		if err != nil {
+			log.Printf("Failed to read range file name: %v", err)
+			return
+		}
+		start, err := readInt64(conn)
+		if err != nil {
+			log.Printf("Failed to read range start: %v", err)
+			return
+		}
+		length, err := readInt64(conn)
+		if err != nil {
+			log.Printf("Failed to read range length: %v", err)
+			return
+		}
+		if err := dk.streamFileRange(fileName, start, length, conn); err != nil {
+			log.Printf("Range serve failed: %v", err)
+		}
+	default:
+		log.Printf("Unknown TCP command %d", command[0])
 	}
-	fileName := string(nameBuf)
+}
 
-	if cmd == 0x01 { // UPLOAD
-		filePath := filepath.Join(dk.baseDir, fileName)
-		file, err := os.Create(filePath)
-		if err != nil {
-			log.Printf("Failed to create file %s: %v", filePath, err)
-			return
-		}
-		defer file.Close()
-
-		if _, err := io.Copy(file, conn); err != nil {
-			log.Printf("Failed to save file content: %v", err)
-			return
-		}
-
-		log.Printf("File %s uploaded/replicated to %s", fileName, filePath)
-
-		// Notify Master Tracker
-		fileInfo, _ := file.Stat()
-		_, err = dk.master.NotifyUpload(context.Background(), &pb.NotifyUploadRequest{
-			FileName: fileName,
-			NodeId:   dk.id,
-			FilePath: filePath,
-			FileSize: fileInfo.Size(),
-		})
-		if err != nil {
-			log.Printf("Failed to notify master: %v", err)
-		}
-	} else if cmd == 0x02 { // DOWNLOAD
-		filePath := filepath.Join(dk.baseDir, fileName)
-		file, err := os.Open(filePath)
-		if err != nil {
-			log.Printf("Failed to open file %s for download: %v", filePath, err)
-			return
-		}
-		defer file.Close()
-
-		if _, err := io.Copy(conn, file); err != nil {
-			log.Printf("Failed to send file content: %v", err)
-		}
-		log.Printf("File %s served for download", fileName)
-	} else if cmd == 0x03 { // RANGE DOWNLOAD
-		// Protocol: [CMD=0x03][NAME_LEN][NAME][START_OFFSET (8 bytes)][LENGTH (8 bytes)]
-		rangeBuf := make([]byte, 16)
-		if _, err := io.ReadFull(conn, rangeBuf); err != nil {
-			log.Printf("Failed to read range: %v", err)
-			return
-		}
-
-		start := int64(uint64(rangeBuf[0])<<56 | uint64(rangeBuf[1])<<48 | uint64(rangeBuf[2])<<40 | uint64(rangeBuf[3])<<32 |
-			uint64(rangeBuf[4])<<24 | uint64(rangeBuf[5])<<16 | uint64(rangeBuf[6])<<8 | uint64(rangeBuf[7]))
-		length := int64(uint64(rangeBuf[8])<<56 | uint64(rangeBuf[9])<<48 | uint64(rangeBuf[10])<<40 | uint64(rangeBuf[11])<<32 |
-			uint64(rangeBuf[12])<<24 | uint64(rangeBuf[13])<<16 | uint64(rangeBuf[14])<<8 | uint64(rangeBuf[15]))
-
-		filePath := filepath.Join(dk.baseDir, fileName)
-		file, err := os.Open(filePath)
-		if err != nil {
-			log.Printf("Failed to open file %s for range download: %v", filePath, err)
-			return
-		}
-		defer file.Close()
-
-		file.Seek(start, 0)
-		if _, err := io.CopyN(conn, file, length); err != nil {
-			log.Printf("Failed to send range content: %v", err)
-		}
-		log.Printf("File %s served range [%d:%d]", fileName, start, start+length)
+func (dk *DataKeeper) receiveUpload(uploadID, rawFileName string, source io.Reader) error {
+	fileName, filePath, err := dk.resolveLocalPath(rawFileName)
+	if err != nil {
+		return err
 	}
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	size, err := io.Copy(file, source)
+	if err != nil {
+		return fmt.Errorf("failed to copy file payload: %w", err)
+	}
+
+	log.Printf("Stored %s locally at %s", fileName, filePath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), masterRPCTimeout)
+	defer cancel()
+
+	_, err = dk.master.NotifyUpload(ctx, &pb.NotifyUploadRequest{
+		UploadId: uploadID,
+		FileName: fileName,
+		NodeId:   dk.id,
+		FilePath: filePath,
+		FileSize: size,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to notify master: %w", err)
+	}
+
+	return nil
+}
+
+func (dk *DataKeeper) streamWholeFile(rawFileName string, destination io.Writer) error {
+	_, filePath, err := dk.resolveLocalPath(rawFileName)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(destination, file); err != nil {
+		return fmt.Errorf("failed to send file: %w", err)
+	}
+
+	log.Printf("Served full download for %s", filepath.Base(filePath))
+	return nil
+}
+
+func (dk *DataKeeper) streamFileRange(rawFileName string, start, length int64, destination io.Writer) error {
+	if start < 0 || length < 0 {
+		return errors.New("range values must be non-negative")
+	}
+
+	_, filePath, err := dk.resolveLocalPath(rawFileName)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek file: %w", err)
+	}
+
+	if length == 0 {
+		return nil
+	}
+
+	if _, err := io.CopyN(destination, file, length); err != nil {
+		return fmt.Errorf("failed to send file range: %w", err)
+	}
+
+	log.Printf("Served %s range [%d:%d]", filepath.Base(filePath), start, start+length)
+	return nil
 }
 
 func (dk *DataKeeper) DeleteFile(ctx context.Context, req *pb.DeleteFileRequest) (*pb.DeleteFileResponse, error) {
-	filePath := filepath.Join(dk.baseDir, req.FileName)
-	err := os.Remove(filePath)
+	_, filePath, err := dk.resolveLocalPath(req.GetFileName())
 	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("File %s already deleted locally", req.FileName)
-			return &pb.DeleteFileResponse{Success: true}, nil
-		}
-		log.Printf("Failed to delete local file %s: %v", filePath, err)
 		return &pb.DeleteFileResponse{Success: false}, err
 	}
-	log.Printf("File %s deleted locally", req.FileName)
+
+	if err := os.Remove(filePath); err != nil {
+		if os.IsNotExist(err) {
+			return &pb.DeleteFileResponse{Success: true}, nil
+		}
+		return &pb.DeleteFileResponse{Success: false}, err
+	}
+
+	log.Printf("Deleted local file %s", filepath.Base(filePath))
 	return &pb.DeleteFileResponse{Success: true}, nil
 }
 
 func (dk *DataKeeper) Wipe(ctx context.Context, req *pb.WipeRequest) (*pb.WipeResponse, error) {
-	files, err := os.ReadDir(dk.baseDir)
+	entries, err := os.ReadDir(dk.baseDir)
 	if err != nil {
-		log.Printf("Wipe: Failed to read base directory %s: %v", dk.baseDir, err)
 		return &pb.WipeResponse{Success: false}, err
 	}
 
-	for _, f := range files {
-		if !f.IsDir() {
-			err := os.Remove(filepath.Join(dk.baseDir, f.Name()))
-			if err != nil {
-				log.Printf("Wipe: Failed to remove file %s: %v", f.Name(), err)
-			}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dk.baseDir, entry.Name())); err != nil {
+			log.Printf("Failed to remove %s during wipe: %v", entry.Name(), err)
 		}
 	}
 
-	log.Printf("Wipe: All files cleared from node disk")
+	log.Printf("Wiped local storage in %s", dk.baseDir)
 	return &pb.WipeResponse{Success: true}, nil
 }
 
 func (dk *DataKeeper) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateResponse, error) {
-	log.Printf("Replicating %s to %s:%d", req.FileName, req.DestinationIp, req.DestinationPort)
+	fileName, filePath, err := dk.resolveLocalPath(req.GetFileName())
+	if err != nil {
+		return nil, err
+	}
 
-	filePath := filepath.Join(dk.baseDir, req.FileName)
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file for replication: %v", err)
+		return nil, fmt.Errorf("failed to open %s for replication: %w", filePath, err)
 	}
 	defer file.Close()
 
-	conn, err := net.Dial("tcp", net.JoinHostPort(req.DestinationIp, fmt.Sprintf("%d", req.DestinationPort)))
+	conn, err := net.Dial("tcp", net.JoinHostPort(req.GetDestinationIp(), fmt.Sprintf("%d", req.GetDestinationPort())))
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to destination for replication: %v", err)
+		return nil, fmt.Errorf("failed to connect to destination keeper: %w", err)
 	}
 	defer conn.Close()
 
-	// Send [CMD][NAME_LEN][NAME][CONTENT]
-	name := req.FileName
-	nameLen := uint32(len(name))
-	header := []byte{0x01, byte(nameLen >> 24), byte(nameLen >> 16), byte(nameLen >> 8), byte(nameLen)}
-	conn.Write(header)
-	conn.Write([]byte(name))
-	io.Copy(conn, file)
+	if _, err := conn.Write([]byte{commandUpload}); err != nil {
+		return nil, fmt.Errorf("failed to send replication command: %w", err)
+	}
+	if err := writeSizedString(conn, ""); err != nil {
+		return nil, fmt.Errorf("failed to send replication upload id: %w", err)
+	}
+	if err := writeSizedString(conn, fileName); err != nil {
+		return nil, fmt.Errorf("failed to send replication file name: %w", err)
+	}
+	if _, err := io.Copy(conn, file); err != nil {
+		return nil, fmt.Errorf("failed to stream replicated file: %w", err)
+	}
 
+	log.Printf("Copied %s to %s:%d", fileName, req.GetDestinationIp(), req.GetDestinationPort())
 	return &pb.ReplicateResponse{Success: true}, nil
 }
 
 func (dk *DataKeeper) StartRPCServer(port int32) {
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatalf("failed to listen for gRPC: %v", err)
+		log.Fatalf("failed to listen for gRPC on %d: %v", port, err)
 	}
-	s := grpc.NewServer()
-	pb.RegisterDataKeeperServer(s, dk)
+
+	server := grpc.NewServer()
+	pb.RegisterDataKeeperServer(server, dk)
 	log.Printf("Data Keeper gRPC server listening on :%d", port)
-	if err := s.Serve(lis); err != nil {
+	if err := server.Serve(listener); err != nil {
 		log.Fatalf("failed to serve gRPC: %v", err)
 	}
+}
+
+func (dk *DataKeeper) resolveLocalPath(rawFileName string) (string, string, error) {
+	fileName := filepath.Base(strings.TrimSpace(rawFileName))
+	if fileName == "" || fileName == "." {
+		return "", "", errors.New("invalid file name")
+	}
+	return fileName, filepath.Join(dk.baseDir, fileName), nil
+}
+
+func readSizedString(reader io.Reader) (string, error) {
+	length, err := readUint32(reader)
+	if err != nil {
+		return "", err
+	}
+
+	buffer := make([]byte, length)
+	if _, err := io.ReadFull(reader, buffer); err != nil {
+		return "", err
+	}
+
+	return string(buffer), nil
+}
+
+func writeSizedString(writer io.Writer, value string) error {
+	if err := binary.Write(writer, binary.BigEndian, uint32(len(value))); err != nil {
+		return err
+	}
+	_, err := writer.Write([]byte(value))
+	return err
+}
+
+func readUint32(reader io.Reader) (uint32, error) {
+	var value uint32
+	err := binary.Read(reader, binary.BigEndian, &value)
+	return value, err
+}
+
+func readInt64(reader io.Reader) (int64, error) {
+	var value int64
+	err := binary.Read(reader, binary.BigEndian, &value)
+	return value, err
 }
 
 func detectAdvertiseIPv4() (string, error) {
@@ -298,11 +425,11 @@ func detectAdvertiseIPv4() (string, error) {
 
 		for _, addr := range addrs {
 			var ip net.IP
-			switch v := addr.(type) {
+			switch value := addr.(type) {
 			case *net.IPNet:
-				ip = v.IP
+				ip = value.IP
 			case *net.IPAddr:
-				ip = v.IP
+				ip = value.IP
 			}
 
 			ip = ip.To4()
@@ -329,9 +456,9 @@ func main() {
 		log.Fatalf("did not connect to master: %v", err)
 	}
 	defer conn.Close()
-	masterClient := pb.NewMasterTrackerClient(conn)
 
-	ip := *advertiseIP
+	masterClient := pb.NewMasterTrackerClient(conn)
+	ip := strings.TrimSpace(*advertiseIP)
 	if ip == "" {
 		detectedIP, err := detectAdvertiseIPv4()
 		if err != nil {
@@ -341,11 +468,10 @@ func main() {
 	}
 
 	log.Printf("Node %s advertising %s:%d to master %s", *id, ip, *tcpPort, *masterAddr)
-	dk := NewDataKeeper(*id, ip, int32(*tcpPort), masterClient)
+	dataKeeper := NewDataKeeper(*id, ip, int32(*tcpPort), masterClient)
 
-	go dk.SendHeartbeat()
-	go dk.StartTCPServer()
+	go dataKeeper.SendHeartbeat()
+	go dataKeeper.StartTCPServer()
 
-	// Master expects DataKeeper gRPC at tcpPort + 1000
-	dk.StartRPCServer(int32(*tcpPort) + 1000)
+	dataKeeper.StartRPCServer(int32(*tcpPort) + 1000)
 }

@@ -2,43 +2,50 @@ syntax = "proto3";
 
 package dfs;
 
-option go_package = "./proto";
+option go_package = "dfs-go/proto;proto";
 
 service MasterTracker {
-  // Data Keeper -> Master Tracker: Heartbeat to signal liveness
-  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
-  
-  // Client -> Master Tracker: Request to upload a file
-  rpc RequestUpload (UploadRequest) returns (UploadResponse);
-  
-  // Client -> Master Tracker: Request to download a file
-  rpc RequestDownload (DownloadRequest) returns (DownloadResponse);
-  
-  // Data Keeper -> Master Tracker: Notify that a file has been successfully uploaded/copied
-  rpc NotifyUpload (NotifyUploadRequest) returns (NotifyUploadResponse);
+  // Data Keeper -> Master Tracker: heartbeat to signal liveness.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
-  // Data Keeper -> Master Tracker: List all local files on startup/sync
-  rpc ReportFiles (ReportFilesRequest) returns (ReportFilesResponse);
+  // Client -> Master Tracker: request a data keeper to receive an upload.
+  rpc RequestUpload(UploadRequest) returns (UploadResponse);
 
-  // Client -> Master Tracker: Request to delete a file
-  rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+  // Client -> Master Tracker: wait for the data keeper to confirm storage.
+  rpc WaitForUpload(WaitForUploadRequest) returns (WaitForUploadResponse);
 
-  // Client -> Master Tracker: Request to delete all files
-  rpc DeleteAllFiles (DeleteAllRequest) returns (DeleteAllResponse);
+  // Client -> Master Tracker: request locations to download a file from.
+  rpc RequestDownload(DownloadRequest) returns (DownloadResponse);
+
+  // Client -> Master Tracker: list all known files.
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+
+  // Data Keeper -> Master Tracker: notify that a file was stored locally.
+  rpc NotifyUpload(NotifyUploadRequest) returns (NotifyUploadResponse);
+
+  // Data Keeper -> Master Tracker: report local files on startup.
+  rpc ReportFiles(ReportFilesRequest) returns (ReportFilesResponse);
+
+  // Optional extension: delete a file across the cluster.
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+
+  // Optional extension: wipe all files across the cluster.
+  rpc DeleteAllFiles(DeleteAllRequest) returns (DeleteAllResponse);
 }
 
 service DataKeeper {
-  // Master Tracker -> Data Keeper: Instruct to replicate a file to another node
-  rpc Replicate (ReplicateRequest) returns (ReplicateResponse);
+  // Master Tracker -> Data Keeper: instruct a source keeper to copy a file.
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
 
-  // Master Tracker -> Data Keeper: Instruct to delete a local file
-  rpc DeleteFile (DeleteFileRequest) returns (DeleteFileResponse);
+  // Optional extension: delete a local file.
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
 
-  // Master Tracker -> Data Keeper: Instruct to wipe all local storage
-  rpc Wipe (WipeRequest) returns (WipeResponse);
+  // Optional extension: wipe local storage.
+  rpc Wipe(WipeRequest) returns (WipeResponse);
 }
 
 message WipeRequest {}
+
 message WipeResponse {
   bool success = 1;
 }
@@ -46,7 +53,7 @@ message WipeResponse {
 message HeartbeatRequest {
   string node_id = 1;
   string ip = 2;
-  int32 port = 3; // TCP port for file transfers
+  int32 port = 3; // TCP port for file transfers.
 }
 
 message HeartbeatResponse {
@@ -59,8 +66,18 @@ message UploadRequest {
 }
 
 message UploadResponse {
-  string node_ip = 1;
-  int32 node_port = 2; // TCP port to connect to
+  string upload_id = 1;
+  string node_ip = 2;
+  int32 node_port = 3; // TCP port to connect to.
+}
+
+message WaitForUploadRequest {
+  string upload_id = 1;
+}
+
+message WaitForUploadResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message DownloadRequest {
@@ -72,16 +89,30 @@ message DownloadResponse {
   int64 file_size = 2;
 }
 
+message ListFilesRequest {}
+
+message FileSummary {
+  string file_name = 1;
+  int64 file_size = 2;
+  int32 alive_replicas = 3;
+  bool fully_replicated = 4;
+}
+
+message ListFilesResponse {
+  repeated FileSummary files = 1;
+}
+
 message NodeLocation {
   string ip = 1;
   int32 port = 2;
 }
 
 message NotifyUploadRequest {
-  string file_name = 1;
-  string node_id = 2;
-  string file_path = 3;
-  int64 file_size = 4;
+  string upload_id = 1;
+  string file_name = 2;
+  string node_id = 3;
+  string file_path = 4;
+  int64 file_size = 5;
 }
 
 message NotifyUploadResponse {
@@ -123,8 +154,7 @@ message DeleteFileResponse {
   bool success = 1;
 }
 
-message DeleteAllRequest {
-}
+message DeleteAllRequest {}
 
 message DeleteAllResponse {
   bool success = 1;

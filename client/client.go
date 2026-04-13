@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,16 +10,42 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	pb "dfs-go/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	clientMasterRPCTimeout      = 5 * time.Second
+	uploadConfirmationWait      = 30 * time.Second
+	dataKeeperDialTimeout       = 5 * time.Second
+	uploadCommand          byte = 0x01
+	downloadCommand        byte = 0x02
+	rangeCommand           byte = 0x03
+	allowedUploadSuffix         = ".mp4"
 )
 
 type ClientApp struct {
 	master pb.MasterTrackerClient
+}
+
+type downloadRange struct {
+	start  int64
+	length int64
+}
+
+type chunkResult struct {
+	index int
+	data  []byte
+	err   error
 }
 
 func main() {
@@ -31,9 +58,8 @@ func main() {
 		log.Fatalf("did not connect to master: %v", err)
 	}
 	defer conn.Close()
-	masterClient := pb.NewMasterTrackerClient(conn)
 
-	app := &ClientApp{master: masterClient}
+	app := &ClientApp{master: pb.NewMasterTrackerClient(conn)}
 
 	http.HandleFunc("/", app.ServeGUI)
 	http.HandleFunc("/api/upload", app.HandleUpload)
@@ -56,30 +82,28 @@ func (app *ClientApp) ServeGUI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *ClientApp) HandleListFiles(w http.ResponseWriter, r *http.Request) {
-	resp, err := app.master.RequestDownload(context.Background(), &pb.DownloadRequest{
-		FileName: "", // Special case or just list all? Master currently returns only for specific file.
-	})
-	// Note: Our Master currently only returns locations for a specific file.
-	// To list ALL files, we'd need a new RPC.
-	// However, for this project, let's assume the Client GUI shows all files known to Master.
-	// I'll update the Master's RequestDownload to return all files if fileName is empty.
+	ctx, cancel := context.WithTimeout(context.Background(), clientMasterRPCTimeout)
+	defer cancel()
 
-	if err != nil && err.Error() != "file not found or no alive nodes have it" {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	resp, err := app.master.ListFiles(ctx, &pb.ListFilesRequest{})
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			http.Error(w, st.Message(), grpcCodeToHTTP(st.Code()))
+			return
+		}
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if resp != nil {
-		json.NewEncoder(w).Encode(resp)
-	} else {
-		fmt.Fprintf(w, `{"Locations": []}`)
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
 func (app *ClientApp) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -90,175 +114,296 @@ func (app *ClientApp) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	fileName := header.Filename
+	fileName := filepath.Base(strings.TrimSpace(header.Filename))
+	if fileName == "" {
+		http.Error(w, "file name is required", http.StatusBadRequest)
+		return
+	}
+	if !strings.EqualFold(filepath.Ext(fileName), allowedUploadSuffix) {
+		http.Error(w, "only .mp4 uploads are supported", http.StatusBadRequest)
+		return
+	}
 
-	// 1. Request node from Master
-	resp, err := app.master.RequestUpload(context.Background(), &pb.UploadRequest{
+	requestCtx, cancel := context.WithTimeout(context.Background(), clientMasterRPCTimeout)
+	uploadTarget, err := app.master.RequestUpload(requestCtx, &pb.UploadRequest{
 		FileName: fileName,
 		FileSize: header.Size,
 	})
+	cancel()
 	if err != nil {
-		http.Error(w, "Master refused upload: "+err.Error(), http.StatusServiceUnavailable)
+		if st, ok := status.FromError(err); ok {
+			http.Error(w, st.Message(), grpcCodeToHTTP(st.Code()))
+			return
+		}
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	// 2. Connect to Data Keeper
-	conn, err := net.Dial("tcp", net.JoinHostPort(resp.NodeIp, fmt.Sprintf("%d", resp.NodePort)))
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(uploadTarget.GetNodeIp(), fmt.Sprintf("%d", uploadTarget.GetNodePort())), dataKeeperDialTimeout)
 	if err != nil {
-		http.Error(w, "Failed to connect to Data Keeper", http.StatusInternalServerError)
+		http.Error(w, "failed to connect to assigned data keeper", http.StatusBadGateway)
 		return
 	}
-	defer conn.Close()
 
-	// 3. Send [CMD=0x01][NAME_LEN][NAME][CONTENT]
-	nameLen := uint32(len(fileName))
-	head := []byte{0x01, byte(nameLen >> 24), byte(nameLen >> 16), byte(nameLen >> 8), byte(nameLen)}
-	conn.Write(head)
-	conn.Write([]byte(fileName))
+	if _, err := conn.Write([]byte{uploadCommand}); err != nil {
+		conn.Close()
+		http.Error(w, "failed to start upload", http.StatusBadGateway)
+		return
+	}
+	if err := writeSizedString(conn, uploadTarget.GetUploadId()); err != nil {
+		conn.Close()
+		http.Error(w, "failed to send upload session id", http.StatusBadGateway)
+		return
+	}
+	if err := writeSizedString(conn, fileName); err != nil {
+		conn.Close()
+		http.Error(w, "failed to send file name", http.StatusBadGateway)
+		return
+	}
+	if _, err := io.Copy(conn, file); err != nil {
+		conn.Close()
+		http.Error(w, "upload transfer failed", http.StatusBadGateway)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		http.Error(w, "failed to finalize upload transfer", http.StatusBadGateway)
+		return
+	}
 
-	_, err = io.Copy(conn, file)
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), uploadConfirmationWait)
+	waitResp, err := app.master.WaitForUpload(waitCtx, &pb.WaitForUploadRequest{
+		UploadId: uploadTarget.GetUploadId(),
+	})
+	waitCancel()
 	if err != nil {
-		http.Error(w, "Upload failed", http.StatusInternalServerError)
+		if st, ok := status.FromError(err); ok {
+			http.Error(w, st.Message(), grpcCodeToHTTP(st.Code()))
+			return
+		}
+		http.Error(w, err.Error(), http.StatusGatewayTimeout)
+		return
+	}
+	if !waitResp.GetSuccess() {
+		http.Error(w, waitResp.GetMessage(), http.StatusBadGateway)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"success": true}`)
+	json.NewEncoder(w).Encode(map[string]any{
+		"success": true,
+		"message": waitResp.GetMessage(),
+	})
 }
 
 func (app *ClientApp) HandleDownload(w http.ResponseWriter, r *http.Request) {
-	fileName := r.URL.Query().Get("name")
+	fileName := filepath.Base(strings.TrimSpace(r.URL.Query().Get("name")))
 	if fileName == "" {
-		http.Error(w, "Missing file name", http.StatusBadRequest)
+		http.Error(w, "missing file name", http.StatusBadRequest)
 		return
 	}
 
-	// 1. Request locations
-	resp, err := app.master.RequestDownload(context.Background(), &pb.DownloadRequest{
-		FileName: fileName,
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), clientMasterRPCTimeout)
+	resp, err := app.master.RequestDownload(ctx, &pb.DownloadRequest{FileName: fileName})
+	cancel()
 	if err != nil {
-		http.Error(w, "File not found", http.StatusNotFound)
-		return
-	}
-
-	if len(resp.Locations) == 0 {
-		http.Error(w, "No copies available", http.StatusNotFound)
-		return
-	}
-
-	// 2. Parallel Download Logic
-	numReplicas := len(resp.Locations)
-	fileSize := resp.FileSize
-	chunkSize := fileSize / int64(numReplicas)
-
-	// Prepare response
-	w.Header().Set("Content-Disposition", "attachment; filename="+fileName)
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
-
-	// If file is empty or only one replica, use simple path
-	if fileSize == 0 || numReplicas == 1 {
-		loc := resp.Locations[0]
-		conn, err := net.Dial("tcp", net.JoinHostPort(loc.Ip, fmt.Sprintf("%d", loc.Port)))
-		if err != nil {
-			http.Error(w, "Failed to connect to storage node", http.StatusInternalServerError)
+		if st, ok := status.FromError(err); ok {
+			http.Error(w, st.Message(), grpcCodeToHTTP(st.Code()))
 			return
 		}
-		defer conn.Close()
-
-		nameLen := uint32(len(fileName))
-		head := []byte{0x02, byte(nameLen >> 24), byte(nameLen >> 16), byte(nameLen >> 8), byte(nameLen)}
-		conn.Write(head)
-		conn.Write([]byte(fileName))
-		io.Copy(w, conn)
+		http.Error(w, "download lookup failed", http.StatusBadGateway)
 		return
 	}
 
-	// Parallel Chunk Fetching
-	results := make([][]byte, numReplicas)
+	if len(resp.GetLocations()) == 0 {
+		http.Error(w, "no alive replicas are available", http.StatusNotFound)
+		return
+	}
+
+	if resp.GetFileSize() == 0 || len(resp.GetLocations()) == 1 {
+		app.streamSingleReplicaDownload(w, fileName, resp)
+		return
+	}
+
+	chunks, err := app.fetchParallelChunks(fileName, resp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", "attachment; filename="+fileName)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.GetFileSize()))
+
+	for _, chunk := range chunks {
+		if _, err := w.Write(chunk); err != nil {
+			log.Printf("failed to write assembled download for %s: %v", fileName, err)
+			return
+		}
+	}
+}
+
+func (app *ClientApp) streamSingleReplicaDownload(w http.ResponseWriter, fileName string, resp *pb.DownloadResponse) {
+	location := resp.GetLocations()[0]
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(location.GetIp(), fmt.Sprintf("%d", location.GetPort())), dataKeeperDialTimeout)
+	if err != nil {
+		http.Error(w, "failed to connect to storage node", http.StatusBadGateway)
+		return
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte{downloadCommand}); err != nil {
+		http.Error(w, "failed to start download", http.StatusBadGateway)
+		return
+	}
+	if err := writeSizedString(conn, fileName); err != nil {
+		http.Error(w, "failed to send file name", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", "attachment; filename="+fileName)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if resp.GetFileSize() > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.GetFileSize()))
+	}
+
+	if _, err := io.Copy(w, conn); err != nil {
+		log.Printf("streamed download for %s ended with error: %v", fileName, err)
+	}
+}
+
+func (app *ClientApp) fetchParallelChunks(fileName string, resp *pb.DownloadResponse) ([][]byte, error) {
+	locations := resp.GetLocations()
+	ranges := splitFileIntoRanges(resp.GetFileSize(), len(locations))
+	results := make([][]byte, len(locations))
+	resultChan := make(chan chunkResult, len(locations))
+
 	var wg sync.WaitGroup
-	errChan := make(chan error, numReplicas)
-
-	for i := 0; i < numReplicas; i++ {
+	for index, location := range locations {
 		wg.Add(1)
-		go func(idx int) {
+		go func(index int, location *pb.NodeLocation, segment downloadRange) {
 			defer wg.Done()
-
-			start := int64(idx) * chunkSize
-			length := chunkSize
-			if idx == numReplicas-1 {
-				length = fileSize - start // Last chunk takes remained
-			}
-
-			loc := resp.Locations[idx]
-			conn, err := net.Dial("tcp", net.JoinHostPort(loc.Ip, fmt.Sprintf("%d", loc.Port)))
-			if err != nil {
-				errChan <- fmt.Errorf("node %s failed: %v", loc.Ip, err)
-				return
-			}
-			defer conn.Close()
-
-			// Send [CMD=0x03][NAME_LEN][NAME][START][LEN]
-			nameLen := uint32(len(fileName))
-			head := []byte{0x03, byte(nameLen >> 24), byte(nameLen >> 16), byte(nameLen >> 8), byte(nameLen)}
-			conn.Write(head)
-			conn.Write([]byte(fileName))
-
-			rangeHeader := make([]byte, 16)
-			for b := 0; b < 8; b++ {
-				rangeHeader[b] = byte(start >> (56 - b*8))
-				rangeHeader[b+8] = byte(length >> (56 - b*8))
-			}
-			conn.Write(rangeHeader)
-
-			buf := make([]byte, length)
-			_, err = io.ReadFull(conn, buf)
-			if err != nil {
-				errChan <- fmt.Errorf("failed to read chunk %d: %v", idx, err)
-				return
-			}
-			results[idx] = buf
-			log.Printf("Chunk %d [%d:%d] received from %s", idx, start, start+length, loc.Ip)
-		}(i)
+			chunk, err := fetchChunkFromReplica(fileName, location, segment)
+			resultChan <- chunkResult{index: index, data: chunk, err: err}
+		}(index, location, ranges[index])
 	}
 
 	wg.Wait()
-	close(errChan)
+	close(resultChan)
 
-	if len(errChan) > 0 {
-		log.Printf("Download had errors, but attempting assembly...")
-	}
-
-	for i := 0; i < numReplicas; i++ {
-		if results[i] != nil {
-			w.Write(results[i])
+	for result := range resultChan {
+		if result.err != nil {
+			return nil, result.err
 		}
+		results[result.index] = result.data
 	}
+
+	return results, nil
+}
+
+func fetchChunkFromReplica(fileName string, location *pb.NodeLocation, segment downloadRange) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(location.GetIp(), fmt.Sprintf("%d", location.GetPort())), dataKeeperDialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to replica %s:%d: %w", location.GetIp(), location.GetPort(), err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte{rangeCommand}); err != nil {
+		return nil, fmt.Errorf("failed to send range command: %w", err)
+	}
+	if err := writeSizedString(conn, fileName); err != nil {
+		return nil, fmt.Errorf("failed to send range file name: %w", err)
+	}
+	if err := binary.Write(conn, binary.BigEndian, segment.start); err != nil {
+		return nil, fmt.Errorf("failed to send range start: %w", err)
+	}
+	if err := binary.Write(conn, binary.BigEndian, segment.length); err != nil {
+		return nil, fmt.Errorf("failed to send range length: %w", err)
+	}
+
+	buffer := make([]byte, int(segment.length))
+	if _, err := io.ReadFull(conn, buffer); err != nil {
+		return nil, fmt.Errorf("failed to read chunk [%d:%d] from %s:%d: %w", segment.start, segment.start+segment.length, location.GetIp(), location.GetPort(), err)
+	}
+
+	log.Printf("Downloaded chunk [%d:%d] from %s:%d", segment.start, segment.start+segment.length, location.GetIp(), location.GetPort())
+	return buffer, nil
+}
+
+func splitFileIntoRanges(fileSize int64, replicas int) []downloadRange {
+	ranges := make([]downloadRange, replicas)
+	if replicas == 0 {
+		return ranges
+	}
+
+	base := fileSize / int64(replicas)
+	remainder := fileSize % int64(replicas)
+	start := int64(0)
+
+	for index := 0; index < replicas; index++ {
+		length := base
+		if int64(index) < remainder {
+			length++
+		}
+		ranges[index] = downloadRange{start: start, length: length}
+		start += length
+	}
+
+	return ranges
 }
 
 func (app *ClientApp) HandleDelete(w http.ResponseWriter, r *http.Request) {
-	fileName := r.URL.Query().Get("name")
+	fileName := filepath.Base(strings.TrimSpace(r.URL.Query().Get("name")))
 	if fileName == "" {
-		http.Error(w, "File name is required", http.StatusBadRequest)
+		http.Error(w, "file name is required", http.StatusBadRequest)
 		return
 	}
 
-	_, err := app.master.DeleteFile(context.Background(), &pb.DeleteFileRequest{FileName: fileName})
-	if err != nil {
-		http.Error(w, "Failed to delete file: "+err.Error(), http.StatusInternalServerError)
+	ctx, cancel := context.WithTimeout(context.Background(), clientMasterRPCTimeout)
+	defer cancel()
+
+	if _, err := app.master.DeleteFile(ctx, &pb.DeleteFileRequest{FileName: fileName}); err != nil {
+		http.Error(w, "failed to delete file: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	fmt.Fprintf(w, `{"success": true}`)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 func (app *ClientApp) HandleDeleteAll(w http.ResponseWriter, r *http.Request) {
-	_, err := app.master.DeleteAllFiles(context.Background(), &pb.DeleteAllRequest{})
-	if err != nil {
-		http.Error(w, "Failed to wipe cluster: "+err.Error(), http.StatusInternalServerError)
+	ctx, cancel := context.WithTimeout(context.Background(), clientMasterRPCTimeout)
+	defer cancel()
+
+	if _, err := app.master.DeleteAllFiles(ctx, &pb.DeleteAllRequest{}); err != nil {
+		http.Error(w, "failed to wipe cluster: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
-	fmt.Fprintf(w, `{"success": true}`)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func writeSizedString(writer io.Writer, value string) error {
+	if err := binary.Write(writer, binary.BigEndian, uint32(len(value))); err != nil {
+		return err
+	}
+	_, err := writer.Write([]byte(value))
+	return err
+}
+
+func grpcCodeToHTTP(code codes.Code) int {
+	switch code {
+	case codes.InvalidArgument:
+		return http.StatusBadRequest
+	case codes.NotFound:
+		return http.StatusNotFound
+	case codes.AlreadyExists:
+		return http.StatusConflict
+	case codes.Unavailable:
+		return http.StatusServiceUnavailable
+	case codes.DeadlineExceeded:
+		return http.StatusGatewayTimeout
+	default:
+		return http.StatusBadGateway
+	}
 }

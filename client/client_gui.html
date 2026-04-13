@@ -4,320 +4,373 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nexus DFS | Client Node</title>
+    <title>Nexus DFS | Client</title>
     <link rel="icon" type="image/jpeg" href="/nexus.jpg">
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap"
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
         rel="stylesheet">
     <style>
         :root {
-            --bg: #05060f;
-            --panel-bg: rgba(30, 31, 46, 0.6);
-            --accent-cyan: #00f2ff;
-            --accent-glow: rgba(0, 242, 255, 0.4);
-            --text-main: #f8fafc;
-            --text-dim: #94a3b8;
-            --border-glass: rgba(255, 255, 255, 0.08);
+            --bg: #09111e;
+            --panel: rgba(9, 20, 38, 0.82);
+            --panel-soft: rgba(14, 28, 49, 0.7);
+            --line: rgba(255, 255, 255, 0.08);
+            --text: #eef4ff;
+            --muted: #9aaec4;
+            --cyan: #45e4ff;
+            --teal: #16d59c;
+            --danger: #ff6b7a;
+            --amber: #f4bf56;
         }
 
         * {
+            box-sizing: border-box;
             margin: 0;
             padding: 0;
-            box-sizing: border-box;
             font-family: 'Outfit', sans-serif;
         }
 
         body {
-            background: var(--bg);
-            background-image:
-                radial-gradient(circle at 0% 0%, rgba(0, 242, 255, 0.03) 0%, transparent 50%),
-                radial-gradient(circle at 100% 100%, rgba(157, 80, 187, 0.03) 0%, transparent 50%);
-            color: var(--text-main);
             min-height: 100vh;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(69, 228, 255, 0.13), transparent 34%),
+                radial-gradient(circle at bottom right, rgba(22, 213, 156, 0.09), transparent 35%),
+                linear-gradient(150deg, #04101c 0%, #09111e 48%, #0c1626 100%);
             display: flex;
-            justify-content: center;
             align-items: center;
-            padding: 2rem;
+            justify-content: center;
+            padding: 1.25rem;
         }
 
-        .client-app {
-            width: 100%;
-            max-width: 900px;
-            background: var(--panel-bg);
-            backdrop-filter: blur(20px);
-            border: 1px solid var(--border-glass);
-            border-radius: 32px;
-            padding: 3rem;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            animation: appScale 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+        .app {
+            width: min(960px, 100%);
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 30px;
+            padding: 2.2rem;
+            backdrop-filter: blur(18px);
+            box-shadow: 0 26px 60px rgba(0, 0, 0, 0.35);
         }
 
         header {
-            text-align: center;
-            margin-bottom: 3rem;
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
         }
 
-        header h1 {
-            font-size: 2.25rem;
-            letter-spacing: -0.02em;
-            margin-bottom: 0.5rem;
-            background: linear-gradient(90deg, #fff, var(--accent-cyan));
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
+        .brand {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
         }
 
-        header p {
-            color: var(--text-dim);
-            font-size: 1.1rem;
+        .brand img {
+            width: 78px;
+            height: 78px;
+            border-radius: 18px;
+            box-shadow: 0 0 26px rgba(69, 228, 255, 0.2);
+        }
+
+        .brand h1 {
+            font-size: 2.2rem;
+            letter-spacing: -0.04em;
+            line-height: 1;
+        }
+
+        .brand p {
+            margin-top: 0.45rem;
+            color: var(--muted);
+        }
+
+        .note-box {
+            min-width: 220px;
+            padding: 1rem 1.1rem;
+            border-radius: 18px;
+            background: var(--panel-soft);
+            border: 1px solid var(--line);
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+
+        .note-box strong {
+            display: block;
+            color: var(--text);
+            margin-bottom: 0.35rem;
         }
 
         .upload-zone {
-            border: 2px dashed var(--border-glass);
-            border-radius: 24px;
-            padding: 4rem 2rem;
+            margin: 1.6rem 0 1.3rem;
+            border: 1.5px dashed rgba(69, 228, 255, 0.36);
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 26px;
+            padding: 2.4rem 1.5rem;
             text-align: center;
-            transition: all 0.3s ease;
             cursor: pointer;
-            position: relative;
-            background: rgba(255, 255, 255, 0.01);
-            margin-bottom: 3rem;
+            transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
         }
 
-        .upload-zone:hover {
-            border-color: var(--accent-cyan);
-            background: rgba(0, 242, 255, 0.02);
-            box-shadow: 0 0 30px rgba(0, 242, 255, 0.1);
-        }
-
+        .upload-zone:hover,
         .upload-zone.dragover {
-            border-color: var(--accent-cyan);
-            background: rgba(0, 242, 255, 0.05);
-            transform: scale(1.02);
+            transform: translateY(-2px);
+            border-color: var(--cyan);
+            background: rgba(69, 228, 255, 0.06);
         }
 
-        .upload-icon {
-            font-size: 3rem;
-            margin-bottom: 1rem;
-            display: block;
+        .upload-zone h2 {
+            font-size: 1.45rem;
+            margin-bottom: 0.35rem;
         }
 
-        .upload-text {
-            font-size: 1.25rem;
-            font-weight: 400;
-            color: var(--text-main);
-        }
-
-        .upload-hint {
-            color: var(--text-dim);
-            margin-top: 0.5rem;
+        .upload-zone p {
+            color: var(--muted);
         }
 
         #file-input {
             display: none;
         }
 
-        .files-section {
-            background: rgba(0, 0, 0, 0.2);
-            border-radius: 20px;
-            padding: 1.5rem;
+        .progress-list {
+            display: grid;
+            gap: 0.85rem;
+            margin-bottom: 1.3rem;
         }
 
-        .section-title {
-            font-size: 0.9rem;
-            text-transform: uppercase;
-            letter-spacing: 0.15em;
-            color: var(--text-dim);
-            margin-bottom: 1.5rem;
+        .progress-card,
+        .section {
+            background: var(--panel-soft);
+            border: 1px solid var(--line);
+            border-radius: 22px;
+        }
+
+        .progress-card {
+            padding: 1rem 1.1rem;
+        }
+
+        .progress-head {
             display: flex;
-            align-items: center;
             justify-content: space-between;
+            gap: 1rem;
+            margin-bottom: 0.65rem;
+            font-size: 0.92rem;
         }
 
-        .file-list {
-            list-style: none;
-        }
-
-        .file-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid var(--border-glass);
-            border-radius: 12px;
-            padding: 1rem 1.5rem;
-            margin-bottom: 0.75rem;
-            transition: transform 0.2s ease;
-        }
-
-        .file-item:hover {
-            transform: translateX(5px);
-            background: rgba(255, 255, 255, 0.05);
-        }
-
-        .file-name {
-            font-weight: 500;
+        .mono {
             font-family: 'JetBrains Mono', monospace;
         }
 
-        .btn-download {
-            background: rgba(0, 242, 255, 0.1);
-            color: var(--accent-cyan);
-            border: 1px solid var(--accent-cyan);
-            padding: 0.5rem 1rem;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 0.8rem;
-            font-weight: 600;
-            transition: all 0.2s ease;
-            margin-left: 0.5rem;
-        }
-
-        .btn-download:hover {
-            background: var(--accent-cyan);
-            color: var(--bg);
-            box-shadow: 0 0 15px var(--accent-glow);
-        }
-
-        .btn-delete {
-            background: rgba(255, 75, 92, 0.1);
-            color: #ff4b5c;
-            border: 1px solid #ff4b5c;
-            padding: 0.5rem 1rem;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 0.8rem;
-            font-weight: 600;
-            transition: all 0.2s ease;
-            margin-left: 0.5rem;
-        }
-
-        .btn-delete:hover {
-            background: #ff4b5c;
-            color: var(--bg);
-            box-shadow: 0 0 15px rgba(255, 75, 92, 0.4);
-        }
-
-        .btn-wipe {
-            background: rgba(255, 75, 92, 0.1);
-            color: #ff4b5c;
-            border: 1px solid #ff4b5c;
-            padding: 0.3rem 0.8rem;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.7rem;
-            font-weight: 600;
-            transition: all 0.2s ease;
-        }
-
-        .btn-wipe:hover {
-            background: #ff4b5c;
-            color: var(--bg);
-        }
-
-        /* Progress Bar */
-        .progress-container {
-            margin-bottom: 1.5rem;
-            background: rgba(255, 255, 255, 0.03);
-            border-radius: 12px;
-            padding: 1.25rem;
-            border: 1px solid var(--border-glass);
-            position: relative;
-            animation: slideIn 0.3s ease-out;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateY(10px);
-            }
-
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+        .progress-bar-wrap {
+            height: 10px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: rgba(255, 255, 255, 0.05);
         }
 
         .progress-bar {
             height: 100%;
-            background: linear-gradient(90deg, var(--accent-cyan), #9d50bb);
             width: 0%;
+            background: linear-gradient(90deg, var(--cyan), var(--teal));
             transition: width 0.1s ease;
         }
 
-        .progress-text {
-            position: absolute;
-            right: 10px;
-            top: 50%;
-            transform: translateY(-50%);
-            font-size: 0.7rem;
-            color: var(--text-dim);
-            font-family: 'JetBrains Mono', monospace;
+        .section {
+            padding: 1.4rem;
         }
 
-        .status-toast {
-            position: fixed;
-            bottom: 2rem;
-            right: 2rem;
-            padding: 1rem 2rem;
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .section-title {
+            font-size: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: var(--muted);
+        }
+
+        .section-subtitle {
+            color: var(--muted);
+            font-size: 0.9rem;
+            margin-top: 0.3rem;
+        }
+
+        .file-list {
+            list-style: none;
+            display: grid;
+            gap: 0.75rem;
+        }
+
+        .file-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem 1.1rem;
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .file-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            margin-top: 0.45rem;
+        }
+
+        .pill {
+            padding: 0.34rem 0.58rem;
+            border-radius: 999px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .pill.ok {
+            color: var(--teal);
+            background: rgba(22, 213, 156, 0.14);
+        }
+
+        .pill.warn {
+            color: var(--amber);
+            background: rgba(244, 191, 86, 0.14);
+        }
+
+        .pill.optional {
+            color: var(--muted);
+            background: rgba(255, 255, 255, 0.07);
+        }
+
+        .actions {
+            display: flex;
+            gap: 0.6rem;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 1px solid transparent;
             border-radius: 12px;
-            background: #1a1b1e;
-            border: 1px solid var(--border-glass);
-            transform: translateY(100px);
-            transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-            z-index: 100;
+            padding: 0.65rem 0.95rem;
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            cursor: pointer;
+            text-transform: uppercase;
+            transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
         }
 
-        .status-toast.show {
+        button:hover {
+            transform: translateY(-1px);
+        }
+
+        .btn-download {
+            background: rgba(69, 228, 255, 0.12);
+            border-color: rgba(69, 228, 255, 0.4);
+            color: var(--cyan);
+        }
+
+        .btn-delete,
+        .btn-wipe {
+            background: rgba(255, 107, 122, 0.12);
+            border-color: rgba(255, 107, 122, 0.34);
+            color: var(--danger);
+        }
+
+        .empty {
+            padding: 1.2rem;
+            text-align: center;
+            color: var(--muted);
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .toast {
+            position: fixed;
+            right: 1.5rem;
+            bottom: 1.5rem;
+            padding: 0.95rem 1.2rem;
+            border-radius: 16px;
+            background: rgba(7, 17, 31, 0.95);
+            border: 1px solid var(--line);
+            box-shadow: 0 18px 34px rgba(0, 0, 0, 0.32);
+            transform: translateY(140px);
+            transition: transform 0.25s ease;
+            max-width: 360px;
+        }
+
+        .toast.show {
             transform: translateY(0);
         }
 
-        @keyframes appScale {
-            from {
-                opacity: 0;
-                transform: scale(0.95);
+        @media (max-width: 820px) {
+            .app {
+                padding: 1.25rem;
             }
 
-            to {
-                opacity: 1;
-                transform: scale(1);
+            header,
+            .file-item,
+            .section-header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .note-box {
+                min-width: 0;
+                width: 100%;
+            }
+
+            .actions {
+                width: 100%;
             }
         }
     </style>
 </head>
 
 <body>
-    <div class="client-app">
+    <div class="app">
         <header>
-            <img src="/nexus.jpg" alt="Nexus Logo"
-                style="width: 80px; height: 80px; margin-bottom: 1rem; border-radius: 16px; box-shadow: 0 0 20px var(--accent-glow);">
-            <h1>Nexus Client</h1>
-            <p>Distributed File System Control Center</p>
+            <div class="brand">
+                <img src="/nexus.jpg" alt="Nexus DFS logo">
+                <div>
+                    <h1>Nexus Client</h1>
+                    <p>Upload, download, and inspect MP4 files stored in the distributed file system.</p>
+                </div>
+            </div>
+            <div class="note-box">
+                <strong>Client behavior</strong>
+                Upload success is shown only after the master tracker confirms the file was stored.
+            </div>
         </header>
 
         <div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
-            <span class="upload-icon">🚀</span>
-            <div class="upload-text">Drop files here to Nexus DFS</div>
-            <div class="upload-hint">or click to browse your local drives</div>
-            <input type="file" id="file-input" multiple>
+            <h2>Drop MP4 files here</h2>
+            <p>The client asks the master for an upload target first, then waits for master confirmation before marking the upload as successful.</p>
+            <input type="file" id="file-input" accept=".mp4" multiple>
         </div>
 
-        <div id="progress-wrapper"></div>
+        <div id="progress-wrapper" class="progress-list"></div>
 
-        <div class="files-section">
-            <div class="section-title">
-                <span>Network Storage</span>
+        <section class="section">
+            <div class="section-header">
                 <div>
-                    <span id="file-count" class="status-badge">0 Files</span>
-                    <button class="btn-wipe" onclick="wipeCluster()" style="margin-left: 10px;">WIPE CLUSTER</button>
+                    <div class="section-title">Tracked Files</div>
+                    <div class="section-subtitle">Delete and wipe are optional extras added on top of the assignment core flow.</div>
+                </div>
+                <div class="actions">
+                    <span id="file-count" class="pill optional">0 files</span>
+                    <button class="btn-wipe" onclick="wipeCluster()">Optional: Wipe Cluster</button>
                 </div>
             </div>
-            <ul id="file-list" class="file-list">
-                <!-- List initialized here -->
-            </ul>
-        </div>
+            <ul id="file-list" class="file-list"></ul>
+        </section>
     </div>
 
-    <div id="toast" class="status-toast"></div>
+    <div id="toast" class="toast"></div>
 
     <script>
         const dropZone = document.getElementById('drop-zone');
@@ -325,80 +378,100 @@
         const fileList = document.getElementById('file-list');
         const toast = document.getElementById('toast');
 
-        function showToast(msg) {
-            toast.innerText = msg;
+        function showToast(message) {
+            toast.innerText = message;
             toast.classList.add('show');
-            setTimeout(() => toast.classList.remove('show'), 3000);
+            setTimeout(() => toast.classList.remove('show'), 3200);
         }
 
-        // Drag and drop handlers
-        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
-            dropZone.addEventListener(evt, e => {
-                e.preventDefault();
-                e.stopPropagation();
-            }, false);
+        function escapeHtml(value) {
+            return value.replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[char]));
+        }
+
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, event => {
+                event.preventDefault();
+                event.stopPropagation();
+            });
         });
 
         dropZone.addEventListener('dragover', () => dropZone.classList.add('dragover'));
         dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-        dropZone.addEventListener('drop', (e) => {
+        dropZone.addEventListener('drop', event => {
             dropZone.classList.remove('dragover');
-            handleFiles(e.dataTransfer.files);
+            handleFiles(event.dataTransfer.files);
         });
 
-        fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
+        fileInput.addEventListener('change', event => handleFiles(event.target.files));
 
         async function handleFiles(files) {
-            for (let file of files) {
+            for (const file of files) {
+                if (!file.name.toLowerCase().endsWith('.mp4')) {
+                    showToast(`Skipped ${file.name}: only .mp4 files are allowed.`);
+                    continue;
+                }
                 uploadFile(file);
             }
+        }
+
+        function createProgressCard(fileName) {
+            const card = document.createElement('div');
+            card.className = 'progress-card';
+            card.innerHTML = `
+                <div class="progress-head">
+                    <span class="mono">${escapeHtml(fileName)}</span>
+                    <span class="mono progress-label">0%</span>
+                </div>
+                <div class="progress-bar-wrap">
+                    <div class="progress-bar"></div>
+                </div>
+            `;
+            document.getElementById('progress-wrapper').appendChild(card);
+            return card;
         }
 
         function uploadFile(file) {
             const formData = new FormData();
             formData.append('file', file);
 
+            const card = createProgressCard(file.name);
+            const progressBar = card.querySelector('.progress-bar');
+            const progressLabel = card.querySelector('.progress-label');
             const xhr = new XMLHttpRequest();
-            const progressWrapper = document.getElementById('progress-wrapper');
 
-            const container = document.createElement('div');
-            container.className = 'progress-container';
-            container.style.display = 'block';
-            container.innerHTML = `
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                    <div style="font-size: 0.75rem; color: var(--text-dim); font-family: 'JetBrains Mono';">${file.name}</div>
-                    <div class="pct-text" style="font-size: 0.75rem; color: var(--accent-cyan); font-family: 'JetBrains Mono';">0%</div>
-                </div>
-                <div class="progress-bar-bg" style="background: rgba(255,255,255,0.03); border-radius: 8px; height: 8px; overflow: hidden; border: 1px solid var(--border-glass); position: relative;">
-                    <div class="progress-bar" style="height: 100%; background: linear-gradient(90deg, var(--accent-cyan), #9d50bb); width: 0%; transition: width 0.1s ease;"></div>
-                </div>
-            `;
-            progressWrapper.appendChild(container);
-
-            const progressBar = container.querySelector('.progress-bar');
-            const pctText = container.querySelector('.pct-text');
             showToast(`Uploading ${file.name}...`);
 
-            xhr.upload.addEventListener('progress', (e) => {
-                if (e.lengthComputable) {
-                    const percent = Math.round((e.loaded / e.total) * 100);
-                    progressBar.style.width = percent + '%';
-                    pctText.innerText = percent + '%';
+            xhr.upload.addEventListener('progress', event => {
+                if (!event.lengthComputable) {
+                    return;
                 }
+                const percent = Math.round((event.loaded / event.total) * 100);
+                progressBar.style.width = `${percent}%`;
+                progressLabel.innerText = `${percent}%`;
             });
 
-            xhr.onreadystatechange = () => {
-                if (xhr.readyState === 4) {
-                    setTimeout(() => {
-                        container.remove();
-                    }, 2000);
-                    if (xhr.status === 200) {
-                        showToast(`Upload successful: ${file.name}`, 'success');
-                        refreshFiles();
-                    } else {
-                        showToast(`Upload failed: ${file.name}`, 'error');
-                    }
+            xhr.onreadystatechange = async () => {
+                if (xhr.readyState !== 4) {
+                    return;
                 }
+
+                setTimeout(() => card.remove(), 2200);
+
+                if (xhr.status === 200) {
+                    const payload = xhr.responseText ? JSON.parse(xhr.responseText) : { message: `Upload successful: ${file.name}` };
+                    showToast(payload.message || `Upload successful: ${file.name}`);
+                    refreshFiles();
+                    return;
+                }
+
+                const errorMessage = xhr.responseText || `Upload failed: ${file.name}`;
+                showToast(errorMessage);
             };
 
             xhr.open('POST', '/api/upload', true);
@@ -409,66 +482,87 @@
             try {
                 const response = await fetch('/api/files');
                 const rawData = await response.json();
+                const files = rawData.files || [];
 
-                // Our hack: Master returns filenames in the 'ip' field when requested with empty string
-                const fileNames = (rawData && rawData.locations) ? rawData.locations.map(l => l.ip) : [];
-
+                document.getElementById('file-count').innerText = `${files.length} file${files.length === 1 ? '' : 's'}`;
                 fileList.innerHTML = '';
-                document.getElementById('file-count').innerText = `${fileNames.length} Files`;
 
-                fileNames.forEach(name => {
-                    if (!name) return;
-                    const li = document.createElement('li');
-                    li.className = 'file-item';
-                    li.innerHTML = `
-                        <div class="file-name">${name}</div>
+                if (!files.length) {
+                    fileList.innerHTML = '<div class="empty">No MP4 files are tracked by the master yet.</div>';
+                    return;
+                }
+
+                files.forEach(file => {
+                    const item = document.createElement('li');
+                    item.className = 'file-item';
+                    item.innerHTML = `
+                        <div>
+                            <div class="mono">${escapeHtml(file.file_name)}</div>
+                            <div class="file-meta">
+                                <span class="pill ${file.fully_replicated ? 'ok' : 'warn'}">
+                                    ${file.fully_replicated ? 'Fully Replicated' : `Only ${file.alive_replicas} Alive`}
+                                </span>
+                                <span class="pill optional">${file.file_size} byte(s)</span>
+                            </div>
+                        </div>
                         <div class="actions">
-                            <button class="btn-download" onclick="downloadFile('${name}')">DOWNLOAD</button>
-                            <button class="btn-delete" onclick="deleteFile('${name}')">DELETE</button>
+                            <button class="btn-download" onclick="downloadFile('${encodeURIComponent(file.file_name)}')">Download</button>
+                            <button class="btn-delete" onclick="deleteFile('${encodeURIComponent(file.file_name)}')">Delete</button>
                         </div>
                     `;
-                    fileList.appendChild(li);
+                    fileList.appendChild(item);
                 });
-            } catch (err) {
-                console.error("Failed to load files", err);
+            } catch (error) {
+                console.error('Failed to load files', error);
+                showToast('Failed to refresh file list.');
             }
         }
 
-        async function downloadFile(name) {
+        function downloadFile(encodedName) {
+            const name = decodeURIComponent(encodedName);
             showToast(`Downloading ${name}...`);
             window.location.href = `/api/download?name=${encodeURIComponent(name)}`;
         }
 
-        async function deleteFile(name) {
-            if (!confirm(`Delete ${name} from all replicas?`)) return;
+        async function deleteFile(encodedName) {
+            const name = decodeURIComponent(encodedName);
+            if (!confirm(`Delete ${name} from every known replica?`)) {
+                return;
+            }
+
             try {
                 const response = await fetch(`/api/delete?name=${encodeURIComponent(name)}`);
-                if (response.ok) {
-                    showToast('File deleted successfully', 'success');
-                    refreshFiles();
+                if (!response.ok) {
+                    showToast(await response.text());
+                    return;
                 }
-            } catch (err) {
-                showToast('Delete failed', 'error');
+                showToast(`Deleted ${name}.`);
+                refreshFiles();
+            } catch (error) {
+                showToast('Delete failed.');
             }
         }
 
         async function wipeCluster() {
-            if (!confirm("Are you sure you want to WIPE the entire cluster? This clears the Master registry.")) return;
+            if (!confirm('Wipe the optional cluster extension and clear all tracked files?')) {
+                return;
+            }
+
             try {
                 const response = await fetch('/api/delete_all');
-                if (response.ok) {
-                    showToast('Cluster Wiped!', 'success');
-                    refreshFiles();
+                if (!response.ok) {
+                    showToast(await response.text());
+                    return;
                 }
-            } catch (err) {
-                showToast('Wipe failed', 'error');
+                showToast('Cluster wipe completed.');
+                refreshFiles();
+            } catch (error) {
+                showToast('Cluster wipe failed.');
             }
         }
 
-        // Initial load and poll
         refreshFiles();
         setInterval(refreshFiles, 5000);
-
     </script>
 </body>
 

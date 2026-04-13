@@ -2,19 +2,37 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	pb "dfs-go/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	desiredReplicaCount     = 3
+	heartbeatGracePeriod    = 5 * time.Second
+	heartbeatMonitorEvery   = 1 * time.Second
+	replicationCheckEvery   = 10 * time.Second
+	masterRPCDialTimeout    = 3 * time.Second
+	completedUploadRetain   = 1 * time.Minute
+	supportedUploadFileType = ".mp4"
 )
 
 type FileRecord struct {
@@ -32,313 +50,751 @@ type NodeStatus struct {
 	IsAlive  bool      `json:"is_alive"`
 }
 
+type UploadSession struct {
+	ID           string
+	FileName     string
+	FileSize     int64
+	TargetNodeID string
+	CreatedAt    time.Time
+	CompletedAt  time.Time
+	Success      bool
+	Message      string
+	done         chan struct{}
+}
+
+type FilePlacement struct {
+	NodeID string `json:"node_id"`
+	Alive  bool   `json:"alive"`
+}
+
+type FileHealth struct {
+	FileName          string          `json:"file_name"`
+	FileSize          int64           `json:"file_size"`
+	AliveReplicas     int             `json:"alive_replicas"`
+	KnownReplicas     int             `json:"known_replicas"`
+	DesiredReplicas   int             `json:"desired_replicas"`
+	FullyReplicated   bool            `json:"fully_replicated"`
+	UnderReplicated   bool            `json:"under_replicated"`
+	MissingReplicas   int             `json:"missing_replicas"`
+	Placements        []FilePlacement `json:"placements"`
+	AliveEnoughToRead bool            `json:"alive_enough_to_read"`
+}
+
+type ClusterMetrics struct {
+	AliveNodes             int `json:"alive_nodes"`
+	TotalNodes             int `json:"total_nodes"`
+	DesiredReplicaCount    int `json:"desired_replica_count"`
+	TotalFiles             int `json:"total_files"`
+	FullyReplicatedFiles   int `json:"fully_replicated_files"`
+	UnderReplicatedFiles   int `json:"under_replicated_files"`
+	FilesWithAliveReplica  int `json:"files_with_alive_replica"`
+	FilesWithoutAliveNodes int `json:"files_without_alive_nodes"`
+}
+
+type DashboardStatus struct {
+	Nodes   []NodeStatus   `json:"nodes"`
+	Files   []FileHealth   `json:"files"`
+	Metrics ClusterMetrics `json:"metrics"`
+}
+
+type replicationTask struct {
+	FileName string
+	Source   NodeStatus
+	Dest     NodeStatus
+}
+
 type MasterTrackerServer struct {
 	pb.UnimplementedMasterTrackerServer
-	mu    sync.RWMutex
-	files []FileRecord
-	nodes map[string]*NodeStatus
+
+	mu             sync.RWMutex
+	fileIndex      map[string]map[string]FileRecord
+	nodes          map[string]*NodeStatus
+	pendingUploads map[string]*UploadSession
 }
 
 func NewMasterTrackerServer() *MasterTrackerServer {
 	return &MasterTrackerServer{
-		nodes: make(map[string]*NodeStatus),
+		fileIndex:      make(map[string]map[string]FileRecord),
+		nodes:          make(map[string]*NodeStatus),
+		pendingUploads: make(map[string]*UploadSession),
 	}
 }
 
 func (s *MasterTrackerServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	if req.GetNodeId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id is required")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	node, exists := s.nodes[req.NodeId]
+	node, exists := s.nodes[req.GetNodeId()]
 	if !exists {
-		node = &NodeStatus{NodeID: req.NodeId}
-		s.nodes[req.NodeId] = node
+		node = &NodeStatus{NodeID: req.GetNodeId()}
+		s.nodes[req.GetNodeId()] = node
 	}
-	node.IP = req.Ip
-	node.Port = req.Port
+
+	node.IP = req.GetIp()
+	node.Port = req.GetPort()
 	node.LastSeen = time.Now()
 	node.IsAlive = true
 
-	log.Printf("Heartbeat from node %s (%s:%d)", req.NodeId, req.Ip, req.Port)
 	return &pb.HeartbeatResponse{Success: true}, nil
 }
 
 func (s *MasterTrackerServer) RequestUpload(ctx context.Context, req *pb.UploadRequest) (*pb.UploadResponse, error) {
+	fileName := strings.TrimSpace(req.GetFileName())
+	if fileName == "" {
+		return nil, status.Error(codes.InvalidArgument, "file_name is required")
+	}
+	if !strings.EqualFold(filepath.Ext(fileName), supportedUploadFileType) {
+		return nil, status.Errorf(codes.InvalidArgument, "only %s files are supported", supportedUploadFileType)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if records := s.fileIndex[fileName]; len(records) > 0 {
+		return nil, status.Error(codes.AlreadyExists, "file already exists; delete it before uploading again")
+	}
+
+	node, err := s.selectUploadNodeLocked()
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+
+	uploadID, err := newUploadID()
+	if err != nil {
+		return nil, status.Error(codes.Internal, "failed to create upload session")
+	}
+
+	s.pendingUploads[uploadID] = &UploadSession{
+		ID:           uploadID,
+		FileName:     fileName,
+		FileSize:     req.GetFileSize(),
+		TargetNodeID: node.NodeID,
+		CreatedAt:    time.Now(),
+		done:         make(chan struct{}),
+	}
+
+	return &pb.UploadResponse{
+		UploadId: uploadID,
+		NodeIp:   node.IP,
+		NodePort: node.Port,
+	}, nil
+}
+
+func (s *MasterTrackerServer) WaitForUpload(ctx context.Context, req *pb.WaitForUploadRequest) (*pb.WaitForUploadResponse, error) {
+	uploadID := strings.TrimSpace(req.GetUploadId())
+	if uploadID == "" {
+		return nil, status.Error(codes.InvalidArgument, "upload_id is required")
+	}
+
+	s.mu.RLock()
+	session, exists := s.pendingUploads[uploadID]
+	if !exists {
+		s.mu.RUnlock()
+		return nil, status.Error(codes.NotFound, "upload session not found")
+	}
+	done := session.done
+	s.mu.RUnlock()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil, status.Error(codes.DeadlineExceeded, "timed out while waiting for upload confirmation")
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Simple load balancing: pick the first alive node
-	for _, node := range s.nodes {
-		if node.IsAlive {
-			return &pb.UploadResponse{
-				NodeIp:   node.IP,
-				NodePort: node.Port,
-			}, nil
-		}
+	session, exists = s.pendingUploads[uploadID]
+	if !exists {
+		return nil, status.Error(codes.NotFound, "upload session expired")
 	}
 
-	return nil, fmt.Errorf("no alive data keepers available")
+	return &pb.WaitForUploadResponse{
+		Success: session.Success,
+		Message: session.Message,
+	}, nil
 }
 
 func (s *MasterTrackerServer) RequestDownload(ctx context.Context, req *pb.DownloadRequest) (*pb.DownloadResponse, error) {
+	fileName := strings.TrimSpace(req.GetFileName())
+	if fileName == "" {
+		return nil, status.Error(codes.InvalidArgument, "file_name is required")
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var locations []*pb.NodeLocation
-	var fileSize int64
-	// Special Case: empty string returns all distinct file names (for GUI listing)
-	if req.FileName == "" {
-		seen := make(map[string]bool)
-		for _, file := range s.files {
-			if !seen[file.FileName] {
-				locations = append(locations, &pb.NodeLocation{Ip: file.FileName}) // Overloading Ip field for name in this hack
-				seen[file.FileName] = true
-			}
-		}
-		return &pb.DownloadResponse{Locations: locations, FileSize: 0}, nil
+	records, exists := s.fileIndex[fileName]
+	if !exists || len(records) == 0 {
+		return nil, status.Error(codes.NotFound, "file not found")
 	}
 
-	for _, file := range s.files {
-		if file.FileName == req.FileName {
-			fileSize = file.FileSize
-			node, exists := s.nodes[file.NodeID]
-			if exists && node.IsAlive {
-				locations = append(locations, &pb.NodeLocation{
-					Ip:   node.IP,
-					Port: node.Port,
-				})
-			}
+	nodeIDs := mapsKeys(records)
+	slices.Sort(nodeIDs)
+
+	var (
+		fileSize  int64
+		locations []*pb.NodeLocation
+	)
+
+	for _, nodeID := range nodeIDs {
+		record := records[nodeID]
+		fileSize = record.FileSize
+		node, exists := s.nodes[nodeID]
+		if exists && node.IsAlive {
+			locations = append(locations, &pb.NodeLocation{
+				Ip:   node.IP,
+				Port: node.Port,
+			})
 		}
 	}
 
-	return &pb.DownloadResponse{Locations: locations, FileSize: fileSize}, nil
+	if len(locations) == 0 {
+		return nil, status.Error(codes.Unavailable, "file exists but no alive data keeper currently has it")
+	}
+
+	return &pb.DownloadResponse{
+		Locations: locations,
+		FileSize:  fileSize,
+	}, nil
+}
+
+func (s *MasterTrackerServer) ListFiles(ctx context.Context, req *pb.ListFilesRequest) (*pb.ListFilesResponse, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	health := s.buildFileHealthLocked()
+	files := make([]*pb.FileSummary, 0, len(health))
+	for _, item := range health {
+		files = append(files, &pb.FileSummary{
+			FileName:        item.FileName,
+			FileSize:        item.FileSize,
+			AliveReplicas:   int32(item.AliveReplicas),
+			FullyReplicated: item.FullyReplicated,
+		})
+	}
+
+	return &pb.ListFilesResponse{Files: files}, nil
 }
 
 func (s *MasterTrackerServer) NotifyUpload(ctx context.Context, req *pb.NotifyUploadRequest) (*pb.NotifyUploadResponse, error) {
+	fileName := strings.TrimSpace(req.GetFileName())
+	nodeID := strings.TrimSpace(req.GetNodeId())
+	if fileName == "" || nodeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "file_name and node_id are required")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.files = append(s.files, FileRecord{
-		FileName: req.FileName,
-		NodeID:   req.NodeId,
-		FilePath: req.FilePath,
-		FileSize: req.FileSize,
+	s.upsertFileRecordLocked(FileRecord{
+		FileName: fileName,
+		NodeID:   nodeID,
+		FilePath: req.GetFilePath(),
+		FileSize: req.GetFileSize(),
 	})
 
-	log.Printf("File %s (%d bytes) uploaded to node %s", req.FileName, req.FileSize, req.NodeId)
+	if uploadID := strings.TrimSpace(req.GetUploadId()); uploadID != "" {
+		session, exists := s.pendingUploads[uploadID]
+		if exists {
+			message := fmt.Sprintf("master confirmed %s on %s", fileName, nodeID)
+			if session.TargetNodeID != nodeID {
+				message = fmt.Sprintf("master confirmed %s on %s (expected %s)", fileName, nodeID, session.TargetNodeID)
+			}
+			session.finish(true, message)
+		}
+	}
+
+	log.Printf("Master recorded %s on %s", fileName, nodeID)
 	return &pb.NotifyUploadResponse{Success: true}, nil
 }
 
-func (s *MasterTrackerServer) DeleteFile(ctx context.Context, req *pb.DeleteFileRequest) (*pb.DeleteFileResponse, error) {
+func (s *MasterTrackerServer) ReportFiles(ctx context.Context, req *pb.ReportFilesRequest) (*pb.ReportFilesResponse, error) {
+	nodeID := strings.TrimSpace(req.GetNodeId())
+	if nodeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id is required")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var deleteLocations []*pb.NodeLocation
-	var remainingFiles []FileRecord
-
-	for _, f := range s.files {
-		if f.FileName == req.FileName {
-			node, exists := s.nodes[f.NodeID]
-			if exists {
-				deleteLocations = append(deleteLocations, &pb.NodeLocation{Ip: node.IP, Port: node.Port})
-			}
-		} else {
-			remainingFiles = append(remainingFiles, f)
+	s.removeNodeRecordsLocked(nodeID)
+	for _, file := range req.GetFiles() {
+		if !strings.EqualFold(filepath.Ext(file.GetFileName()), supportedUploadFileType) {
+			continue
 		}
-	}
-	s.files = remainingFiles
-
-	// Asynchronously tell nodes to delete files
-	for _, loc := range deleteLocations {
-		go func(l *pb.NodeLocation) {
-			conn, err := grpc.NewClient(net.JoinHostPort(l.Ip, fmt.Sprintf("%d", l.Port+1000)), grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			client := pb.NewDataKeeperClient(conn)
-			client.DeleteFile(context.Background(), &pb.DeleteFileRequest{FileName: req.FileName})
-		}(loc)
+		s.upsertFileRecordLocked(FileRecord{
+			FileName: file.GetFileName(),
+			NodeID:   nodeID,
+			FilePath: file.GetFilePath(),
+			FileSize: file.GetFileSize(),
+		})
 	}
 
-	log.Printf("File %s deleted from registry, commanded %d nodes to wipe", req.FileName, len(deleteLocations))
+	log.Printf("Master synchronized %d local file(s) from %s", len(req.GetFiles()), nodeID)
+	return &pb.ReportFilesResponse{Success: true}, nil
+}
+
+func (s *MasterTrackerServer) DeleteFile(ctx context.Context, req *pb.DeleteFileRequest) (*pb.DeleteFileResponse, error) {
+	fileName := strings.TrimSpace(req.GetFileName())
+	if fileName == "" {
+		return nil, status.Error(codes.InvalidArgument, "file_name is required")
+	}
+
+	s.mu.Lock()
+	targets := s.collectDeleteTargetsLocked(fileName)
+	delete(s.fileIndex, fileName)
+	s.mu.Unlock()
+
+	for _, target := range targets {
+		go s.deleteFileOnNode(target, fileName)
+	}
+
+	log.Printf("Deleted %s from master registry and notified %d keeper(s)", fileName, len(targets))
 	return &pb.DeleteFileResponse{Success: true}, nil
 }
 
 func (s *MasterTrackerServer) DeleteAllFiles(ctx context.Context, req *pb.DeleteAllRequest) (*pb.DeleteAllResponse, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	totalFiles := len(s.files)
-	s.files = []FileRecord{}
-
-	// Broadcast wipe to all alive nodes
+	targets := make([]NodeStatus, 0, len(s.nodes))
 	for _, node := range s.nodes {
 		if node.IsAlive {
-			go func(n *NodeStatus) {
-				conn, err := grpc.NewClient(net.JoinHostPort(n.IP, fmt.Sprintf("%d", n.Port+1000)), grpc.WithTransportCredentials(insecure.NewCredentials()))
-				if err != nil {
-					return
-				}
-				defer conn.Close()
-				client := pb.NewDataKeeperClient(conn)
-				_, err = client.Wipe(context.Background(), &pb.WipeRequest{})
-				if err != nil {
-					log.Printf("Failed to wipe node %s: %v", n.NodeID, err)
-				}
-			}(node)
+			targets = append(targets, *node)
 		}
 	}
+	s.fileIndex = make(map[string]map[string]FileRecord)
+	s.mu.Unlock()
 
-	log.Printf("NEXUS Cluster WIPE: Clear all %d records", totalFiles)
+	for _, target := range targets {
+		go s.wipeNode(target)
+	}
+
+	log.Printf("Cleared master registry and notified %d alive keeper(s) to wipe local storage", len(targets))
 	return &pb.DeleteAllResponse{Success: true}, nil
 }
 
-func (s *MasterTrackerServer) ReportFiles(ctx context.Context, req *pb.ReportFilesRequest) (*pb.ReportFilesResponse, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Dedup: remove existing records for this node before adding new ones
-	var updatedFiles []FileRecord
-	for _, f := range s.files {
-		if f.NodeID != req.NodeId {
-			updatedFiles = append(updatedFiles, f)
-		}
-	}
-	s.files = updatedFiles
-
-	for _, f := range req.Files {
-		s.files = append(s.files, FileRecord{
-			FileName: f.FileName,
-			NodeID:   req.NodeId,
-			FilePath: f.FilePath,
-			FileSize: f.FileSize,
-		})
-	}
-
-	log.Printf("Node %s synchronized %d existing files", req.NodeId, len(req.Files))
-	return &pb.ReportFilesResponse{Success: true}, nil
-}
-
-// Background thread to check node liveness and trigger replication
 func (s *MasterTrackerServer) MonitorNodes() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(heartbeatMonitorEvery)
+	defer ticker.Stop()
+
 	for range ticker.C {
 		s.mu.Lock()
 		now := time.Now()
-		for id, node := range s.nodes {
-			if node.IsAlive && now.Sub(node.LastSeen) > 5*time.Second {
-				log.Printf("Node %s is DOWN", id)
+		for _, node := range s.nodes {
+			if node.IsAlive && now.Sub(node.LastSeen) > heartbeatGracePeriod {
 				node.IsAlive = false
+				log.Printf("Node %s marked DOWN", node.NodeID)
 			}
 		}
+		s.cleanupUploadSessionsLocked(now)
 		s.mu.Unlock()
 	}
 }
 
-// Replication Manager: awake every 10s as per requirements
 func (s *MasterTrackerServer) ReplicationManager() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(replicationCheckEvery)
+	defer ticker.Stop()
+
 	for range ticker.C {
-		s.checkReplication()
-	}
-}
-
-func (s *MasterTrackerServer) checkReplication() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	fileCounts := make(map[string]int)
-	fileHolders := make(map[string][]string) // fileName -> []nodeID
-
-	for _, f := range s.files {
-		node, exists := s.nodes[f.NodeID]
-		if exists && node.IsAlive {
-			fileCounts[f.FileName]++
-			fileHolders[f.FileName] = append(fileHolders[f.FileName], f.NodeID)
+		for _, task := range s.buildReplicationTasks() {
+			go s.callReplicate(task)
 		}
-	}
-
-	for fileName, count := range fileCounts {
-		if count < 3 {
-			log.Printf("File %s has only %d replicas, triggering replication", fileName, count)
-			s.triggerReplication(fileName, fileHolders[fileName])
-		}
-	}
-}
-
-func (s *MasterTrackerServer) triggerReplication(fileName string, holders []string) {
-	if len(holders) == 0 {
-		return
-	}
-
-	// Pick a source node
-	sourceID := holders[0]
-	sourceNode := s.nodes[sourceID]
-
-	// Find a destination node that doesn't have the file
-	var destNode *NodeStatus
-	for _, node := range s.nodes {
-		if node.IsAlive {
-			alreadyHas := false
-			for _, holderID := range holders {
-				if holderID == node.NodeID {
-					alreadyHas = true
-					break
-				}
-			}
-			if !alreadyHas {
-				destNode = node
-				break
-			}
-		}
-	}
-
-	if destNode != nil {
-		log.Printf("Instructing node %s to replicate %s to %s", sourceID, fileName, destNode.NodeID)
-		go s.callReplicate(sourceNode, destNode, fileName)
-	}
-}
-
-func (s *MasterTrackerServer) callReplicate(source, dest *NodeStatus, fileName string) {
-	conn, err := grpc.NewClient(net.JoinHostPort(source.IP, fmt.Sprintf("%d", source.Port+1000)), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Printf("Failed to connect to source node %s: %v", source.NodeID, err)
-		return
-	}
-	defer conn.Close()
-
-	client := pb.NewDataKeeperClient(conn)
-	_, err = client.Replicate(context.Background(), &pb.ReplicateRequest{
-		FileName:        fileName,
-		SourceIp:        source.IP,
-		SourcePort:      source.Port,
-		DestinationIp:   dest.IP,
-		DestinationPort: dest.Port,
-	})
-	if err != nil {
-		log.Printf("Failed to trigger replication on node %s: %v", source.NodeID, err)
 	}
 }
 
 func (s *MasterTrackerServer) StatusAPI(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	data := struct {
-		Nodes map[string]*NodeStatus `json:"nodes"`
-		Files []FileRecord           `json:"files"`
-	}{
-		Nodes: s.nodes,
-		Files: s.files,
-	}
+	status := s.buildDashboardStatusLocked()
+	s.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(status); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (s *MasterTrackerServer) ServeDashboard(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "master/dashboard.html")
+}
+
+func (s *MasterTrackerServer) selectUploadNodeLocked() (*NodeStatus, error) {
+	var alive []*NodeStatus
+	for _, node := range s.nodes {
+		if node.IsAlive {
+			alive = append(alive, node)
+		}
+	}
+	if len(alive) == 0 {
+		return nil, errors.New("no alive data keepers available")
+	}
+
+	slices.SortFunc(alive, func(left, right *NodeStatus) int {
+		leftLoad := s.nodeLoadLocked(left.NodeID)
+		rightLoad := s.nodeLoadLocked(right.NodeID)
+		switch {
+		case leftLoad < rightLoad:
+			return -1
+		case leftLoad > rightLoad:
+			return 1
+		case left.NodeID < right.NodeID:
+			return -1
+		case left.NodeID > right.NodeID:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	return alive[0], nil
+}
+
+func (s *MasterTrackerServer) nodeLoadLocked(nodeID string) int {
+	load := 0
+	for _, holders := range s.fileIndex {
+		if _, exists := holders[nodeID]; exists {
+			load++
+		}
+	}
+	return load
+}
+
+func (s *MasterTrackerServer) upsertFileRecordLocked(record FileRecord) {
+	holders, exists := s.fileIndex[record.FileName]
+	if !exists {
+		holders = make(map[string]FileRecord)
+		s.fileIndex[record.FileName] = holders
+	}
+	holders[record.NodeID] = record
+}
+
+func (s *MasterTrackerServer) removeNodeRecordsLocked(nodeID string) {
+	for fileName, holders := range s.fileIndex {
+		delete(holders, nodeID)
+		if len(holders) == 0 {
+			delete(s.fileIndex, fileName)
+		}
+	}
+}
+
+func (s *MasterTrackerServer) buildReplicationTasks() []replicationTask {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	aliveNodes := make([]NodeStatus, 0, len(s.nodes))
+	for _, node := range s.nodes {
+		if node.IsAlive {
+			aliveNodes = append(aliveNodes, *node)
+		}
+	}
+	slices.SortFunc(aliveNodes, func(left, right NodeStatus) int {
+		switch {
+		case left.NodeID < right.NodeID:
+			return -1
+		case left.NodeID > right.NodeID:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	if len(aliveNodes) == 0 {
+		return nil
+	}
+
+	fileNames := mapsKeys(s.fileIndex)
+	slices.Sort(fileNames)
+
+	var tasks []replicationTask
+	for _, fileName := range fileNames {
+		holders := s.fileIndex[fileName]
+		aliveHolderIDs := make([]string, 0, len(holders))
+		for nodeID := range holders {
+			if node, exists := s.nodes[nodeID]; exists && node.IsAlive {
+				aliveHolderIDs = append(aliveHolderIDs, nodeID)
+			}
+		}
+		slices.Sort(aliveHolderIDs)
+
+		if len(aliveHolderIDs) == 0 {
+			log.Printf("Replication skipped for %s: no alive source keeper currently has the file", fileName)
+			continue
+		}
+
+		targetReplicaCount := minInt(desiredReplicaCount, len(aliveNodes))
+		if len(aliveHolderIDs) >= targetReplicaCount {
+			if len(aliveHolderIDs) < desiredReplicaCount {
+				log.Printf("File %s remains under-replicated: %d/%d replicas because only %d keeper(s) are alive", fileName, len(aliveHolderIDs), desiredReplicaCount, len(aliveNodes))
+			}
+			continue
+		}
+
+		sourceNode := *s.nodes[aliveHolderIDs[0]]
+		plannedHolders := make(map[string]bool, len(aliveHolderIDs))
+		for _, nodeID := range aliveHolderIDs {
+			plannedHolders[nodeID] = true
+		}
+
+		for _, candidate := range aliveNodes {
+			if len(plannedHolders) >= targetReplicaCount {
+				break
+			}
+			if plannedHolders[candidate.NodeID] {
+				continue
+			}
+			plannedHolders[candidate.NodeID] = true
+			tasks = append(tasks, replicationTask{
+				FileName: fileName,
+				Source:   sourceNode,
+				Dest:     candidate,
+			})
+		}
+
+		log.Printf("Replication planner scheduled %d new copy/copies for %s (%d alive replica(s), %d alive keeper(s))", len(plannedHolders)-len(aliveHolderIDs), fileName, len(aliveHolderIDs), len(aliveNodes))
+	}
+
+	return tasks
+}
+
+func (s *MasterTrackerServer) callReplicate(task replicationTask) {
+	ctx, cancel := context.WithTimeout(context.Background(), masterRPCDialTimeout)
+	defer cancel()
+
+	conn, err := grpc.NewClient(
+		net.JoinHostPort(task.Source.IP, fmt.Sprintf("%d", task.Source.Port+1000)),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Printf("Failed to connect to source keeper %s: %v", task.Source.NodeID, err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewDataKeeperClient(conn)
+	_, err = client.Replicate(ctx, &pb.ReplicateRequest{
+		FileName:        task.FileName,
+		SourceIp:        task.Source.IP,
+		SourcePort:      task.Source.Port,
+		DestinationIp:   task.Dest.IP,
+		DestinationPort: task.Dest.Port,
+	})
+	if err != nil {
+		log.Printf("Failed to replicate %s from %s to %s: %v", task.FileName, task.Source.NodeID, task.Dest.NodeID, err)
+		return
+	}
+
+	log.Printf("Replication command sent for %s from %s to %s", task.FileName, task.Source.NodeID, task.Dest.NodeID)
+}
+
+func (s *MasterTrackerServer) deleteFileOnNode(node NodeStatus, fileName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), masterRPCDialTimeout)
+	defer cancel()
+
+	conn, err := grpc.NewClient(
+		net.JoinHostPort(node.IP, fmt.Sprintf("%d", node.Port+1000)),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Printf("Delete RPC connection to %s failed: %v", node.NodeID, err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewDataKeeperClient(conn)
+	if _, err := client.DeleteFile(ctx, &pb.DeleteFileRequest{FileName: fileName}); err != nil {
+		log.Printf("Delete RPC to %s failed: %v", node.NodeID, err)
+	}
+}
+
+func (s *MasterTrackerServer) wipeNode(node NodeStatus) {
+	ctx, cancel := context.WithTimeout(context.Background(), masterRPCDialTimeout)
+	defer cancel()
+
+	conn, err := grpc.NewClient(
+		net.JoinHostPort(node.IP, fmt.Sprintf("%d", node.Port+1000)),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Printf("Wipe RPC connection to %s failed: %v", node.NodeID, err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewDataKeeperClient(conn)
+	if _, err := client.Wipe(ctx, &pb.WipeRequest{}); err != nil {
+		log.Printf("Wipe RPC to %s failed: %v", node.NodeID, err)
+	}
+}
+
+func (s *MasterTrackerServer) collectDeleteTargetsLocked(fileName string) []NodeStatus {
+	records := s.fileIndex[fileName]
+	if len(records) == 0 {
+		return nil
+	}
+
+	nodeIDs := mapsKeys(records)
+	slices.Sort(nodeIDs)
+
+	targets := make([]NodeStatus, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if node, exists := s.nodes[nodeID]; exists {
+			targets = append(targets, *node)
+		}
+	}
+
+	return targets
+}
+
+func (s *MasterTrackerServer) buildDashboardStatusLocked() DashboardStatus {
+	nodes := make([]NodeStatus, 0, len(s.nodes))
+	for _, node := range s.nodes {
+		nodes = append(nodes, *node)
+	}
+	slices.SortFunc(nodes, func(left, right NodeStatus) int {
+		switch {
+		case left.NodeID < right.NodeID:
+			return -1
+		case left.NodeID > right.NodeID:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	files := s.buildFileHealthLocked()
+	metrics := ClusterMetrics{
+		DesiredReplicaCount: desiredReplicaCount,
+		TotalNodes:          len(nodes),
+		TotalFiles:          len(files),
+	}
+
+	for _, node := range nodes {
+		if node.IsAlive {
+			metrics.AliveNodes++
+		}
+	}
+
+	for _, file := range files {
+		if file.FullyReplicated {
+			metrics.FullyReplicatedFiles++
+		} else {
+			metrics.UnderReplicatedFiles++
+		}
+		if file.AliveReplicas > 0 {
+			metrics.FilesWithAliveReplica++
+		} else {
+			metrics.FilesWithoutAliveNodes++
+		}
+	}
+
+	return DashboardStatus{
+		Nodes:   nodes,
+		Files:   files,
+		Metrics: metrics,
+	}
+}
+
+func (s *MasterTrackerServer) buildFileHealthLocked() []FileHealth {
+	fileNames := mapsKeys(s.fileIndex)
+	slices.Sort(fileNames)
+
+	files := make([]FileHealth, 0, len(fileNames))
+	for _, fileName := range fileNames {
+		holders := s.fileIndex[fileName]
+		nodeIDs := mapsKeys(holders)
+		slices.Sort(nodeIDs)
+
+		var (
+			fileSize      int64
+			aliveReplicas int
+			placements    []FilePlacement
+		)
+
+		for _, nodeID := range nodeIDs {
+			record := holders[nodeID]
+			fileSize = record.FileSize
+			alive := false
+			if node, exists := s.nodes[nodeID]; exists {
+				alive = node.IsAlive
+			}
+			if alive {
+				aliveReplicas++
+			}
+			placements = append(placements, FilePlacement{
+				NodeID: nodeID,
+				Alive:  alive,
+			})
+		}
+
+		files = append(files, FileHealth{
+			FileName:          fileName,
+			FileSize:          fileSize,
+			AliveReplicas:     aliveReplicas,
+			KnownReplicas:     len(nodeIDs),
+			DesiredReplicas:   desiredReplicaCount,
+			FullyReplicated:   aliveReplicas >= desiredReplicaCount,
+			UnderReplicated:   aliveReplicas < desiredReplicaCount,
+			MissingReplicas:   maxInt(desiredReplicaCount-aliveReplicas, 0),
+			Placements:        placements,
+			AliveEnoughToRead: aliveReplicas > 0,
+		})
+	}
+
+	return files
+}
+
+func (s *MasterTrackerServer) cleanupUploadSessionsLocked(now time.Time) {
+	for _, session := range s.pendingUploads {
+		if session.CompletedAt.IsZero() {
+			continue
+		}
+		if now.Sub(session.CompletedAt) > completedUploadRetain {
+			delete(s.pendingUploads, session.ID)
+		}
+	}
+}
+
+func (s *UploadSession) finish(success bool, message string) {
+	if !s.CompletedAt.IsZero() {
+		return
+	}
+	s.Success = success
+	s.Message = message
+	s.CompletedAt = time.Now()
+	close(s.done)
+}
+
+func newUploadID() (string, error) {
+	buffer := make([]byte, 8)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buffer), nil
+}
+
+func mapsKeys[T any](input map[string]T) []string {
+	keys := make([]string, 0, len(input))
+	for key := range input {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func main() {
@@ -346,33 +802,33 @@ func main() {
 	dashboardListenAddr := flag.String("dashboard-listen", ":8080", "HTTP dashboard listen address")
 	flag.Parse()
 
-	lis, err := net.Listen("tcp", *grpcListenAddr)
+	listener, err := net.Listen("tcp", *grpcListenAddr)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	s := grpc.NewServer()
-	srv := NewMasterTrackerServer()
-	pb.RegisterMasterTrackerServer(s, srv)
+	grpcServer := grpc.NewServer()
+	server := NewMasterTrackerServer()
+	pb.RegisterMasterTrackerServer(grpcServer, server)
 
-	go srv.MonitorNodes()
-	go srv.ReplicationManager()
+	go server.MonitorNodes()
+	go server.ReplicationManager()
 
-	// Start HTTP Server for Dashboard
-	http.HandleFunc("/", srv.ServeDashboard)
-	http.HandleFunc("/api/status", srv.StatusAPI)
+	http.HandleFunc("/", server.ServeDashboard)
+	http.HandleFunc("/api/status", server.StatusAPI)
 	http.HandleFunc("/nexus.jpg", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "nexus.jpg")
 	})
+
 	go func() {
 		log.Printf("Dashboard listening on %s", *dashboardListenAddr)
 		if err := http.ListenAndServe(*dashboardListenAddr, nil); err != nil {
-			log.Printf("HTTP server failed: %v", err)
+			log.Printf("dashboard server stopped: %v", err)
 		}
 	}()
 
 	log.Printf("Master Tracker listening on %s", *grpcListenAddr)
-	if err := s.Serve(lis); err != nil {
+	if err := grpcServer.Serve(listener); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
 }
