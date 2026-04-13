@@ -595,12 +595,37 @@ func copyExactWithBuffer(destination io.Writer, source io.Reader, totalBytes int
 
 type transferReporter struct {
 	callback         func(int64, pb.TransferStatus, string, bool)
+	updates          chan transferUpdate
+	done             chan struct{}
 	lastReportedAt   time.Time
 	lastReportedByte int64
 }
 
+type transferUpdate struct {
+	bytesTransferred int64
+	status           pb.TransferStatus
+	message          string
+	logFailures      bool
+}
+
 func newTransferReporter(callback func(int64, pb.TransferStatus, string, bool)) *transferReporter {
-	return &transferReporter{callback: callback}
+	reporter := &transferReporter{
+		callback: callback,
+		updates:  make(chan transferUpdate, 1),
+		done:     make(chan struct{}),
+	}
+
+	go func() {
+		defer close(reporter.done)
+		for update := range reporter.updates {
+			if reporter.callback == nil {
+				continue
+			}
+			reporter.callback(update.bytesTransferred, update.status, update.message, update.logFailures)
+		}
+	}()
+
+	return reporter
 }
 
 func (tr *transferReporter) maybeReport(bytesTransferred int64, status pb.TransferStatus, message string) {
@@ -622,10 +647,36 @@ func (tr *transferReporter) report(bytesTransferred int64, status pb.TransferSta
 
 	tr.lastReportedByte = bytesTransferred
 	tr.lastReportedAt = time.Now()
-	tr.callback(bytesTransferred, status, message, logFailures)
+	tr.enqueue(transferUpdate{
+		bytesTransferred: bytesTransferred,
+		status:           status,
+		message:          message,
+		logFailures:      logFailures,
+	})
 }
 
-func (tr *transferReporter) close() {}
+func (tr *transferReporter) enqueue(update transferUpdate) {
+	select {
+	case tr.updates <- update:
+		return
+	default:
+	}
+
+	select {
+	case <-tr.updates:
+	default:
+	}
+
+	tr.updates <- update
+}
+
+func (tr *transferReporter) close() {
+	if tr.callback == nil {
+		return
+	}
+	close(tr.updates)
+	<-tr.done
+}
 
 func replicationJobKey(fileName, destinationNodeID, transferID string) string {
 	return strings.Join([]string{fileName, destinationNodeID, transferID}, "\x00")

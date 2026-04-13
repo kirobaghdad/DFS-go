@@ -419,6 +419,36 @@
             return 'warn';
         }
 
+        function formatMegabytes(bytes) {
+            const value = Number(bytes || 0) / (1024 * 1024);
+            if (value >= 100) {
+                return value.toFixed(1);
+            }
+            return value.toFixed(2);
+        }
+
+        function formatTransferRate(transfer) {
+            const observedRate = Number(transfer.transfer_rate_mbps || 0);
+            if (observedRate > 0) {
+                return `${observedRate.toFixed(2)} MB/s`;
+            }
+
+            const averageRate = Number(transfer.average_rate_mbps || 0);
+            if (averageRate > 0) {
+                return `${averageRate.toFixed(2)} MB/s`;
+            }
+
+            const startedAt = Date.parse(transfer.started_at || '');
+            const updatedAt = Date.parse(transfer.updated_at || '');
+            if (!Number.isFinite(startedAt) || !Number.isFinite(updatedAt) || updatedAt <= startedAt) {
+                return '0.00 MB/s';
+            }
+
+            const elapsedSeconds = Math.max((updatedAt - startedAt) / 1000, 0.001);
+            const transferredMB = Number(transfer.bytes_transferred || 0) / (1024 * 1024);
+            return `${(transferredMB / elapsedSeconds).toFixed(2)} MB/s`;
+        }
+
         async function updateDashboard() {
             try {
                 const response = await fetch('/api/status');
@@ -489,6 +519,9 @@
                 } else {
                     transfers.forEach(transfer => {
                         const progress = Math.max(0, Math.min(100, Number(transfer.percent_complete || 0))).toFixed(1);
+                        const transferredMB = formatMegabytes(transfer.bytes_transferred);
+                        const totalMB = formatMegabytes(transfer.total_bytes);
+                        const rate = formatTransferRate(transfer);
                         const item = document.createElement('li');
                         item.className = 'item';
                         item.innerHTML = `
@@ -496,7 +529,8 @@
                                 <div class="name mono">${transfer.file_name}</div>
                                 <div class="subtext">${transfer.source_node_id} -> ${transfer.destination_node_id}</div>
                                 <div class="subtext">${transfer.message || 'Waiting for an update from the source node.'}</div>
-                                <div class="subtext mono">${transfer.bytes_transferred || 0} / ${transfer.total_bytes || 0} byte(s)</div>
+                                <div class="subtext mono">${transferredMB} MB / ${totalMB} MB</div>
+                                <div class="subtext">Progress: ${progress}% | Rate: ${rate}</div>
                                 <div class="progress-track">
                                     <div class="progress-fill ${progressClassForTransfer(transfer)}" style="width: ${progress}%"></div>
                                 </div>

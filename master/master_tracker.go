@@ -114,7 +114,13 @@ type TransferProgress struct {
 	StartedAt         time.Time `json:"started_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 	PercentComplete   float64   `json:"percent_complete"`
+	TransferRateMBps  float64   `json:"transfer_rate_mbps"`
+	AverageRateMBps   float64   `json:"average_rate_mbps"`
 	Active            bool      `json:"active"`
+
+	RunningStartedAt time.Time `json:"-"`
+	LastSampleAt     time.Time `json:"-"`
+	LastSampleBytes  int64     `json:"-"`
 }
 
 type DashboardStatus struct {
@@ -340,15 +346,44 @@ func (s *MasterTrackerServer) ReportTransferProgress(ctx context.Context, req *p
 	if req.GetTotalBytes() > 0 {
 		transfer.TotalBytes = req.GetTotalBytes()
 	}
-	if req.GetBytesTransferred() > transfer.BytesTransferred {
-		transfer.BytesTransferred = req.GetBytesTransferred()
+	now := time.Now()
+	incomingBytes := maxInt64(req.GetBytesTransferred(), transfer.BytesTransferred)
+	if incomingBytes > transfer.BytesTransferred {
+		transfer.BytesTransferred = incomingBytes
 	}
 	transfer.Message = strings.TrimSpace(req.GetMessage())
 	transfer.Status = transferStatusLabel(req.GetStatus())
 	transfer.Active = !isTransferTerminal(transfer.Status)
-	transfer.UpdatedAt = time.Now()
+	transfer.UpdatedAt = now
 	if transfer.TotalBytes > 0 {
 		transfer.PercentComplete = minFloat64(float64(transfer.BytesTransferred)*100/float64(transfer.TotalBytes), 100)
+	}
+	if transfer.Status == transferStatusRunning || transfer.Status == transferStatusAwaitingConfirmation || transfer.Status == transferStatusCompleted {
+		if transfer.RunningStartedAt.IsZero() {
+			transfer.RunningStartedAt = now
+		}
+	}
+	if transfer.LastSampleAt.IsZero() {
+		transfer.LastSampleAt = now
+		transfer.LastSampleBytes = incomingBytes
+	} else if incomingBytes >= transfer.LastSampleBytes {
+		deltaBytes := incomingBytes - transfer.LastSampleBytes
+		deltaSeconds := now.Sub(transfer.LastSampleAt).Seconds()
+		if deltaBytes > 0 && deltaSeconds > 0 {
+			sampleRate := bytesToMiB(float64(deltaBytes)) / deltaSeconds
+			transfer.TransferRateMBps = smoothTransferRate(transfer.TransferRateMBps, sampleRate)
+		}
+		transfer.LastSampleAt = now
+		transfer.LastSampleBytes = incomingBytes
+	}
+	if !transfer.RunningStartedAt.IsZero() && transfer.BytesTransferred > 0 {
+		elapsedSeconds := now.Sub(transfer.RunningStartedAt).Seconds()
+		if elapsedSeconds > 0 {
+			transfer.AverageRateMBps = bytesToMiB(float64(transfer.BytesTransferred)) / elapsedSeconds
+			if transfer.TransferRateMBps <= 0 {
+				transfer.TransferRateMBps = transfer.AverageRateMBps
+			}
+		}
 	}
 
 	if transfer.Status == transferStatusFailed {
@@ -975,6 +1010,15 @@ func (s *MasterTrackerServer) markReplicationConfirmedLocked(fileName, destinati
 	transfer.Status = transferStatusCompleted
 	transfer.Message = fmt.Sprintf("master confirmed %s on %s", fileName, destinationNodeID)
 	transfer.UpdatedAt = time.Now()
+	if transfer.RunningStartedAt.IsZero() {
+		transfer.RunningStartedAt = transfer.StartedAt
+	}
+	if elapsedSeconds := transfer.UpdatedAt.Sub(transfer.RunningStartedAt).Seconds(); elapsedSeconds > 0 {
+		transfer.AverageRateMBps = bytesToMiB(float64(transfer.BytesTransferred)) / elapsedSeconds
+		if transfer.TransferRateMBps <= 0 {
+			transfer.TransferRateMBps = transfer.AverageRateMBps
+		}
+	}
 	transfer.Active = false
 	delete(s.activeTransfers, replicationKey(fileName, destinationNodeID))
 }
@@ -1048,6 +1092,20 @@ func minFloat64(left, right float64) float64 {
 		return left
 	}
 	return right
+}
+
+func bytesToMiB(bytes float64) float64 {
+	return bytes / (1024 * 1024)
+}
+
+func smoothTransferRate(previous, sample float64) float64 {
+	if sample <= 0 {
+		return previous
+	}
+	if previous <= 0 {
+		return sample
+	}
+	return previous*0.6 + sample*0.4
 }
 
 func (s *MasterTrackerServer) countActiveTransfersLocked() int {
