@@ -17,7 +17,9 @@ import (
 	pb "dfs-go/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -25,33 +27,39 @@ const (
 	commandDownload     byte = 0x02
 	commandRangeRequest byte = 0x03
 
-	heartbeatEvery       = 1 * time.Second
-	masterRPCTimeout     = 3 * time.Second
-	supportedMediaSuffix = ".mp4"
+	heartbeatEvery         = 1 * time.Second
+	heartbeatRPCTimeout    = 10 * time.Second
+	reportFilesRPCTimeout  = 20 * time.Second
+	notifyUploadRPCTimeout = 15 * time.Second
+	supportedMediaSuffix   = ".mp4"
+	transferBufferSize     = 1024 * 1024
+	socketBufferSize       = 4 * 1024 * 1024
 )
 
 type DataKeeper struct {
 	pb.UnimplementedDataKeeperServer
 
-	id      string
-	ip      string
-	tcpPort int32
-	master  pb.MasterTrackerClient
-	baseDir string
+	id         string
+	ip         string
+	tcpPort    int32
+	masterAddr string
+	master     pb.MasterTrackerClient
+	baseDir    string
 }
 
-func NewDataKeeper(id, ip string, tcpPort int32, master pb.MasterTrackerClient) *DataKeeper {
+func NewDataKeeper(id, ip string, tcpPort int32, masterAddr string, master pb.MasterTrackerClient) *DataKeeper {
 	baseDir := fmt.Sprintf("data_%s", id)
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		log.Fatalf("failed to create data directory %s: %v", baseDir, err)
 	}
 
 	return &DataKeeper{
-		id:      id,
-		ip:      ip,
-		tcpPort: tcpPort,
-		master:  master,
-		baseDir: baseDir,
+		id:         id,
+		ip:         ip,
+		tcpPort:    tcpPort,
+		masterAddr: masterAddr,
+		master:     master,
+		baseDir:    baseDir,
 	}
 }
 
@@ -62,15 +70,15 @@ func (dk *DataKeeper) SendHeartbeat() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), masterRPCTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), heartbeatRPCTimeout)
 		_, err := dk.master.Heartbeat(ctx, &pb.HeartbeatRequest{
 			NodeId: dk.id,
 			Ip:     dk.ip,
 			Port:   dk.tcpPort,
-		})
+		}, grpc.WaitForReady(true))
 		cancel()
 		if err != nil {
-			log.Printf("Heartbeat to master failed: %v", err)
+			dk.logMasterRPCError("heartbeat", err)
 		}
 	}
 }
@@ -102,14 +110,14 @@ func (dk *DataKeeper) SyncExistingFiles() {
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), masterRPCTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), reportFilesRPCTimeout)
 	defer cancel()
 
 	if _, err := dk.master.ReportFiles(ctx, &pb.ReportFilesRequest{
 		NodeId: dk.id,
 		Files:  fileInfos,
-	}); err != nil {
-		log.Printf("Failed to report local files to master: %v", err)
+	}, grpc.WaitForReady(true)); err != nil {
+		dk.logMasterRPCError("startup file sync", err)
 		return
 	}
 
@@ -131,6 +139,7 @@ func (dk *DataKeeper) StartTCPServer() {
 			log.Printf("TCP accept failed: %v", err)
 			continue
 		}
+		configureTCPConn(conn)
 		go dk.handleTCPConnection(conn)
 	}
 }
@@ -156,7 +165,12 @@ func (dk *DataKeeper) handleTCPConnection(conn net.Conn) {
 			log.Printf("Failed to read upload file name: %v", err)
 			return
 		}
-		if err := dk.receiveUpload(uploadID, fileName, conn); err != nil {
+		expectedSize, err := readInt64(conn)
+		if err != nil {
+			log.Printf("Failed to read expected upload size: %v", err)
+			return
+		}
+		if err := dk.receiveUpload(uploadID, fileName, expectedSize, conn); err != nil {
 			log.Printf("Upload receive failed: %v", err)
 		}
 	case commandDownload:
@@ -192,26 +206,44 @@ func (dk *DataKeeper) handleTCPConnection(conn net.Conn) {
 	}
 }
 
-func (dk *DataKeeper) receiveUpload(uploadID, rawFileName string, source io.Reader) error {
+func (dk *DataKeeper) receiveUpload(uploadID, rawFileName string, expectedSize int64, source io.Reader) error {
 	fileName, filePath, err := dk.resolveLocalPath(rawFileName)
 	if err != nil {
 		return err
 	}
 
-	file, err := os.Create(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to create %s: %w", filePath, err)
-	}
-	defer file.Close()
-
-	size, err := io.Copy(file, source)
-	if err != nil {
-		return fmt.Errorf("failed to copy file payload: %w", err)
+	if expectedSize < 0 {
+		return fmt.Errorf("invalid expected size %d", expectedSize)
 	}
 
-	log.Printf("Stored %s locally at %s", fileName, filePath)
+	tempPath := filePath + ".part"
+	file, err := os.Create(tempPath)
+	if err != nil {
+		return fmt.Errorf("failed to create %s: %w", tempPath, err)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), masterRPCTimeout)
+	size, err := io.CopyN(file, source, expectedSize)
+	closeErr := file.Close()
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to copy file payload: received %d of %d byte(s): %w", size, expectedSize, err)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to finalize temp file: %w", closeErr)
+	}
+	if size != expectedSize {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("upload incomplete: received %d of %d byte(s)", size, expectedSize)
+	}
+	if err := os.Rename(tempPath, filePath); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("failed to move completed file into place: %w", err)
+	}
+
+	log.Printf("Stored %s locally at %s (%d byte(s))", fileName, filePath, size)
+
+	ctx, cancel := context.WithTimeout(context.Background(), notifyUploadRPCTimeout)
 	defer cancel()
 
 	_, err = dk.master.NotifyUpload(ctx, &pb.NotifyUploadRequest{
@@ -220,7 +252,7 @@ func (dk *DataKeeper) receiveUpload(uploadID, rawFileName string, source io.Read
 		NodeId:   dk.id,
 		FilePath: filePath,
 		FileSize: size,
-	})
+	}, grpc.WaitForReady(true))
 	if err != nil {
 		return fmt.Errorf("failed to notify master: %w", err)
 	}
@@ -327,12 +359,17 @@ func (dk *DataKeeper) Replicate(ctx context.Context, req *pb.ReplicateRequest) (
 		return nil, fmt.Errorf("failed to open %s for replication: %w", filePath, err)
 	}
 	defer file.Close()
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat %s for replication: %w", filePath, err)
+	}
 
 	conn, err := net.Dial("tcp", net.JoinHostPort(req.GetDestinationIp(), fmt.Sprintf("%d", req.GetDestinationPort())))
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to destination keeper: %w", err)
 	}
 	defer conn.Close()
+	configureTCPConn(conn)
 
 	if _, err := conn.Write([]byte{commandUpload}); err != nil {
 		return nil, fmt.Errorf("failed to send replication command: %w", err)
@@ -343,7 +380,10 @@ func (dk *DataKeeper) Replicate(ctx context.Context, req *pb.ReplicateRequest) (
 	if err := writeSizedString(conn, fileName); err != nil {
 		return nil, fmt.Errorf("failed to send replication file name: %w", err)
 	}
-	if _, err := io.Copy(conn, file); err != nil {
+	if err := binary.Write(conn, binary.BigEndian, fileInfo.Size()); err != nil {
+		return nil, fmt.Errorf("failed to send replication file size: %w", err)
+	}
+	if _, err := io.CopyBuffer(conn, file, make([]byte, transferBufferSize)); err != nil {
 		return nil, fmt.Errorf("failed to stream replicated file: %w", err)
 	}
 
@@ -405,6 +445,15 @@ func readInt64(reader io.Reader) (int64, error) {
 	var value int64
 	err := binary.Read(reader, binary.BigEndian, &value)
 	return value, err
+}
+
+func configureTCPConn(conn net.Conn) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcpConn.SetReadBuffer(socketBufferSize)
+	_ = tcpConn.SetWriteBuffer(socketBufferSize)
 }
 
 func detectAdvertiseIPv4(masterAddr string) (string, error) {
@@ -485,10 +534,27 @@ func main() {
 	}
 
 	log.Printf("Node %s advertising %s:%d to master %s", *id, ip, *tcpPort, *masterAddr)
-	dataKeeper := NewDataKeeper(*id, ip, int32(*tcpPort), masterClient)
+	dataKeeper := NewDataKeeper(*id, ip, int32(*tcpPort), *masterAddr, masterClient)
 
 	go dataKeeper.SendHeartbeat()
 	go dataKeeper.StartTCPServer()
 
 	dataKeeper.StartRPCServer(int32(*tcpPort) + 1000)
+}
+
+func (dk *DataKeeper) logMasterRPCError(operation string, err error) {
+	st, ok := status.FromError(err)
+	if !ok {
+		log.Printf("%s to master %s failed: %v", strings.Title(operation), dk.masterAddr, err)
+		return
+	}
+
+	switch st.Code() {
+	case codes.DeadlineExceeded:
+		log.Printf("%s to master %s timed out. Check that the master is running, the IP/port is correct, and the firewall allows gRPC on that port.", strings.Title(operation), dk.masterAddr)
+	case codes.Unavailable:
+		log.Printf("%s to master %s failed because the master is unavailable. Check startup order, IP address, and network reachability.", strings.Title(operation), dk.masterAddr)
+	default:
+		log.Printf("%s to master %s failed: %s", strings.Title(operation), dk.masterAddr, st.Message())
+	}
 }

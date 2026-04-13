@@ -291,6 +291,26 @@ func (s *MasterTrackerServer) NotifyUpload(ctx context.Context, req *pb.NotifyUp
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if uploadID := strings.TrimSpace(req.GetUploadId()); uploadID != "" {
+		session, exists := s.pendingUploads[uploadID]
+		if !exists {
+			return nil, status.Error(codes.NotFound, "upload session not found")
+		}
+
+		if session.FileName != fileName {
+			session.finish(false, fmt.Sprintf("upload rejected: expected file %s but node reported %s", session.FileName, fileName))
+			return nil, status.Error(codes.InvalidArgument, "upload file name does not match session")
+		}
+		if session.TargetNodeID != nodeID {
+			session.finish(false, fmt.Sprintf("upload rejected: expected target %s but node reported %s", session.TargetNodeID, nodeID))
+			return nil, status.Error(codes.InvalidArgument, "upload node does not match session")
+		}
+		if session.FileSize != req.GetFileSize() {
+			session.finish(false, fmt.Sprintf("upload incomplete: expected %d byte(s) but received %d", session.FileSize, req.GetFileSize()))
+			return nil, status.Error(codes.FailedPrecondition, "upload size does not match session")
+		}
+	}
+
 	s.upsertFileRecordLocked(FileRecord{
 		FileName: fileName,
 		NodeID:   nodeID,
@@ -301,11 +321,7 @@ func (s *MasterTrackerServer) NotifyUpload(ctx context.Context, req *pb.NotifyUp
 	if uploadID := strings.TrimSpace(req.GetUploadId()); uploadID != "" {
 		session, exists := s.pendingUploads[uploadID]
 		if exists {
-			message := fmt.Sprintf("master confirmed %s on %s", fileName, nodeID)
-			if session.TargetNodeID != nodeID {
-				message = fmt.Sprintf("master confirmed %s on %s (expected %s)", fileName, nodeID, session.TargetNodeID)
-			}
-			session.finish(true, message)
+			session.finish(true, fmt.Sprintf("master confirmed %s on %s", fileName, nodeID))
 		}
 	}
 

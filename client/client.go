@@ -31,6 +31,8 @@ const (
 	downloadCommand        byte = 0x02
 	rangeCommand           byte = 0x03
 	allowedUploadSuffix         = ".mp4"
+	transferBufferSize          = 1024 * 1024
+	socketBufferSize            = 4 * 1024 * 1024
 )
 
 type ClientApp struct {
@@ -144,6 +146,7 @@ func (app *ClientApp) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to connect to assigned data keeper", http.StatusBadGateway)
 		return
 	}
+	configureTCPConn(conn)
 
 	if _, err := conn.Write([]byte{uploadCommand}); err != nil {
 		conn.Close()
@@ -160,7 +163,12 @@ func (app *ClientApp) HandleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to send file name", http.StatusBadGateway)
 		return
 	}
-	if _, err := io.Copy(conn, file); err != nil {
+	if err := binary.Write(conn, binary.BigEndian, header.Size); err != nil {
+		conn.Close()
+		http.Error(w, "failed to send file size", http.StatusBadGateway)
+		return
+	}
+	if _, err := io.CopyBuffer(conn, file, make([]byte, transferBufferSize)); err != nil {
 		conn.Close()
 		http.Error(w, "upload transfer failed", http.StatusBadGateway)
 		return
@@ -250,6 +258,7 @@ func (app *ClientApp) streamSingleReplicaDownload(w http.ResponseWriter, fileNam
 		return
 	}
 	defer conn.Close()
+	configureTCPConn(conn)
 
 	if _, err := conn.Write([]byte{downloadCommand}); err != nil {
 		http.Error(w, "failed to start download", http.StatusBadGateway)
@@ -306,6 +315,7 @@ func fetchChunkFromReplica(fileName string, location *pb.NodeLocation, segment d
 		return nil, fmt.Errorf("failed to connect to replica %s:%d: %w", location.GetIp(), location.GetPort(), err)
 	}
 	defer conn.Close()
+	configureTCPConn(conn)
 
 	if _, err := conn.Write([]byte{rangeCommand}); err != nil {
 		return nil, fmt.Errorf("failed to send range command: %w", err)
@@ -389,6 +399,15 @@ func writeSizedString(writer io.Writer, value string) error {
 	}
 	_, err := writer.Write([]byte(value))
 	return err
+}
+
+func configureTCPConn(conn net.Conn) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcpConn.SetReadBuffer(socketBufferSize)
+	_ = tcpConn.SetWriteBuffer(socketBufferSize)
 }
 
 func grpcCodeToHTTP(code codes.Code) int {

@@ -92,3 +92,42 @@ func TestFileHealthStaysUnderReplicatedWhenOnlyTwoNodesAreAlive(t *testing.T) {
 		t.Fatalf("expected 2 alive replicas, got %d", health[0].AliveReplicas)
 	}
 }
+
+func TestNotifyUploadRejectsIncompleteClientTransfer(t *testing.T) {
+	server := NewMasterTrackerServer()
+	now := time.Now()
+	server.nodes["node1"] = &NodeStatus{NodeID: "node1", IP: "10.0.0.1", Port: 7001, IsAlive: true, LastSeen: now}
+	server.pendingUploads["upload-1"] = &UploadSession{
+		ID:           "upload-1",
+		FileName:     "video.mp4",
+		FileSize:     100,
+		TargetNodeID: "node1",
+		CreatedAt:    now,
+		done:         make(chan struct{}),
+	}
+
+	_, err := server.NotifyUpload(context.Background(), &pb.NotifyUploadRequest{
+		UploadId: "upload-1",
+		FileName: "video.mp4",
+		NodeId:   "node1",
+		FilePath: "data_node1/video.mp4",
+		FileSize: 60,
+	})
+	if err == nil {
+		t.Fatalf("expected incomplete upload to be rejected")
+	}
+
+	session := server.pendingUploads["upload-1"]
+	if session == nil {
+		t.Fatalf("expected upload session to remain available")
+	}
+	if session.Success {
+		t.Fatalf("expected failed upload session")
+	}
+	if session.CompletedAt.IsZero() {
+		t.Fatalf("expected failed upload session to be completed")
+	}
+	if records := server.fileIndex["video.mp4"]; len(records) != 0 {
+		t.Fatalf("expected incomplete upload to stay out of file index")
+	}
+}
