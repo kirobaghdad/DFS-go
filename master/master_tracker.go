@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -341,7 +342,11 @@ func (s *MasterTrackerServer) ServeDashboard(w http.ResponseWriter, r *http.Requ
 }
 
 func main() {
-	lis, err := net.Listen("tcp", ":50051")
+	grpcListenAddr := flag.String("grpc-listen", ":50051", "gRPC listen address for master tracker")
+	dashboardListenAddr := flag.String("dashboard-listen", ":8080", "HTTP dashboard listen address")
+	flag.Parse()
+
+	lis, err := net.Listen("tcp", *grpcListenAddr)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
@@ -360,13 +365,13 @@ func main() {
 		http.ServeFile(w, r, "nexus.jpg")
 	})
 	go func() {
-		log.Println("Dashboard available at http://localhost:8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Printf("Dashboard listening on %s", *dashboardListenAddr)
+		if err := http.ListenAndServe(*dashboardListenAddr, nil); err != nil {
 			log.Printf("HTTP server failed: %v", err)
 		}
 	}()
 
-	log.Println("Master Tracker listening on :50051")
+	log.Printf("Master Tracker listening on %s", *grpcListenAddr)
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}

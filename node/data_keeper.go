@@ -280,10 +280,48 @@ func (dk *DataKeeper) StartRPCServer(port int32) {
 	}
 }
 
+func detectAdvertiseIPv4() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			ip = ip.To4()
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+
+			return ip.String(), nil
+		}
+	}
+
+	return "", fmt.Errorf("no non-loopback IPv4 found")
+}
+
 func main() {
 	id := flag.String("id", "node1", "Node ID")
 	tcpPort := flag.Int("port", 7000, "TCP port for file transfer")
 	masterAddr := flag.String("master", "localhost:50051", "Master Tracker address")
+	advertiseIP := flag.String("advertise-ip", "", "Node IP/hostname advertised to master (auto-detected if empty)")
 	flag.Parse()
 
 	conn, err := grpc.NewClient(*masterAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -293,7 +331,16 @@ func main() {
 	defer conn.Close()
 	masterClient := pb.NewMasterTrackerClient(conn)
 
-	ip := "127.0.0.1" // In a real system, get actual IP
+	ip := *advertiseIP
+	if ip == "" {
+		detectedIP, err := detectAdvertiseIPv4()
+		if err != nil {
+			log.Fatalf("failed to auto-detect node IP, set -advertise-ip explicitly: %v", err)
+		}
+		ip = detectedIP
+	}
+
+	log.Printf("Node %s advertising %s:%d to master %s", *id, ip, *tcpPort, *masterAddr)
 	dk := NewDataKeeper(*id, ip, int32(*tcpPort), masterClient)
 
 	go dk.SendHeartbeat()
