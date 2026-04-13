@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	pb "dfs-go/proto"
@@ -27,13 +28,16 @@ const (
 	commandDownload     byte = 0x02
 	commandRangeRequest byte = 0x03
 
-	heartbeatEvery         = 1 * time.Second
-	heartbeatRPCTimeout    = 10 * time.Second
-	reportFilesRPCTimeout  = 20 * time.Second
-	notifyUploadRPCTimeout = 15 * time.Second
-	supportedMediaSuffix   = ".mp4"
-	transferBufferSize     = 1024 * 1024
-	socketBufferSize       = 4 * 1024 * 1024
+	heartbeatEvery          = 1 * time.Second
+	heartbeatRPCTimeout     = 10 * time.Second
+	reportFilesRPCTimeout   = 20 * time.Second
+	notifyUploadRPCTimeout  = 15 * time.Second
+	transferProgressTimeout = 1 * time.Second
+	transferProgressEvery   = 750 * time.Millisecond
+	transferProgressStep    = 4 * 1024 * 1024
+	supportedMediaSuffix    = ".mp4"
+	transferBufferSize      = 1024 * 1024
+	socketBufferSize        = 4 * 1024 * 1024
 )
 
 type DataKeeper struct {
@@ -45,6 +49,9 @@ type DataKeeper struct {
 	masterAddr string
 	master     pb.MasterTrackerClient
 	baseDir    string
+
+	replicationMu      sync.Mutex
+	activeReplications map[string]struct{}
 }
 
 func NewDataKeeper(id, ip string, tcpPort int32, masterAddr string, master pb.MasterTrackerClient) *DataKeeper {
@@ -54,12 +61,13 @@ func NewDataKeeper(id, ip string, tcpPort int32, masterAddr string, master pb.Ma
 	}
 
 	return &DataKeeper{
-		id:         id,
-		ip:         ip,
-		tcpPort:    tcpPort,
-		masterAddr: masterAddr,
-		master:     master,
-		baseDir:    baseDir,
+		id:                 id,
+		ip:                 ip,
+		tcpPort:            tcpPort,
+		masterAddr:         masterAddr,
+		master:             master,
+		baseDir:            baseDir,
+		activeReplications: make(map[string]struct{}),
 	}
 }
 
@@ -222,7 +230,7 @@ func (dk *DataKeeper) receiveUpload(uploadID, rawFileName string, expectedSize i
 		return fmt.Errorf("failed to create %s: %w", tempPath, err)
 	}
 
-	size, err := io.CopyN(file, source, expectedSize)
+	size, err := copyExactWithBuffer(file, source, expectedSize, nil)
 	closeErr := file.Close()
 	if err != nil {
 		_ = os.Remove(tempPath)
@@ -272,7 +280,7 @@ func (dk *DataKeeper) streamWholeFile(rawFileName string, destination io.Writer)
 	}
 	defer file.Close()
 
-	if _, err := io.Copy(destination, file); err != nil {
+	if _, err := io.CopyBuffer(destination, file, make([]byte, transferBufferSize)); err != nil {
 		return fmt.Errorf("failed to send file: %w", err)
 	}
 
@@ -304,7 +312,7 @@ func (dk *DataKeeper) streamFileRange(rawFileName string, start, length int64, d
 		return nil
 	}
 
-	if _, err := io.CopyN(destination, file, length); err != nil {
+	if _, err := io.CopyBuffer(destination, io.LimitReader(file, length), make([]byte, transferBufferSize)); err != nil {
 		return fmt.Errorf("failed to send file range: %w", err)
 	}
 
@@ -358,37 +366,120 @@ func (dk *DataKeeper) Replicate(ctx context.Context, req *pb.ReplicateRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s for replication: %w", filePath, err)
 	}
-	defer file.Close()
 	fileInfo, err := file.Stat()
+	closeErr := file.Close()
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat %s for replication: %w", filePath, err)
 	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("failed to close %s after stat: %w", filePath, closeErr)
+	}
+
+	transferID := strings.TrimSpace(req.GetTransferId())
+	if transferID == "" {
+		return nil, errors.New("transfer_id is required")
+	}
+
+	jobKey := replicationJobKey(fileName, req.GetDestinationNodeId(), transferID)
+	if !dk.startReplicationJob(jobKey) {
+		log.Printf("Replication for %s to %s is already running locally", fileName, req.GetDestinationNodeId())
+		return &pb.ReplicateResponse{Success: true}, nil
+	}
+
+	go dk.runReplication(jobKey, req, filePath, fileInfo.Size())
+	return &pb.ReplicateResponse{Success: true}, nil
+}
+
+func (dk *DataKeeper) runReplication(jobKey string, req *pb.ReplicateRequest, filePath string, fileSize int64) {
+	defer dk.finishReplicationJob(jobKey)
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("failed to open source file: %v", err), true)
+		return
+	}
+	defer file.Close()
+
+	dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_QUEUED, "source node accepted the replication command", false)
 
 	conn, err := net.Dial("tcp", net.JoinHostPort(req.GetDestinationIp(), fmt.Sprintf("%d", req.GetDestinationPort())))
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to destination keeper: %w", err)
+		dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("failed to connect to destination keeper: %v", err), true)
+		return
 	}
 	defer conn.Close()
 	configureTCPConn(conn)
 
 	if _, err := conn.Write([]byte{commandUpload}); err != nil {
-		return nil, fmt.Errorf("failed to send replication command: %w", err)
+		dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("failed to send replication command: %v", err), true)
+		return
 	}
 	if err := writeSizedString(conn, ""); err != nil {
-		return nil, fmt.Errorf("failed to send replication upload id: %w", err)
+		dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("failed to send replication upload id: %v", err), true)
+		return
 	}
-	if err := writeSizedString(conn, fileName); err != nil {
-		return nil, fmt.Errorf("failed to send replication file name: %w", err)
+	if err := writeSizedString(conn, req.GetFileName()); err != nil {
+		dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("failed to send replication file name: %v", err), true)
+		return
 	}
-	if err := binary.Write(conn, binary.BigEndian, fileInfo.Size()); err != nil {
-		return nil, fmt.Errorf("failed to send replication file size: %w", err)
-	}
-	if _, err := io.CopyBuffer(conn, file, make([]byte, transferBufferSize)); err != nil {
-		return nil, fmt.Errorf("failed to stream replicated file: %w", err)
+	if err := binary.Write(conn, binary.BigEndian, fileSize); err != nil {
+		dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("failed to send replication file size: %v", err), true)
+		return
 	}
 
-	log.Printf("Copied %s to %s:%d", fileName, req.GetDestinationIp(), req.GetDestinationPort())
-	return &pb.ReplicateResponse{Success: true}, nil
+	reporter := newTransferReporter(func(bytesTransferred int64, status pb.TransferStatus, message string, logFailures bool) {
+		dk.reportTransferProgress(req, bytesTransferred, fileSize, status, message, logFailures)
+	})
+	defer reporter.close()
+	reporter.report(0, pb.TransferStatus_TRANSFER_STATUS_RUNNING, "streaming data to the destination keeper", false)
+
+	written, err := copyExactWithBuffer(conn, file, fileSize, func(bytesTransferred int64) {
+		reporter.maybeReport(bytesTransferred, pb.TransferStatus_TRANSFER_STATUS_RUNNING, "streaming data to the destination keeper")
+	})
+	if err != nil {
+		reporter.report(written, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("replication stopped after %d of %d byte(s): %v", written, fileSize, err), true)
+		return
+	}
+
+	reporter.report(fileSize, pb.TransferStatus_TRANSFER_STATUS_AWAITING_CONFIRMATION, "stream finished; waiting for destination confirmation", false)
+	log.Printf("Replication stream for %s to %s:%d finished", req.GetFileName(), req.GetDestinationIp(), req.GetDestinationPort())
+}
+
+func (dk *DataKeeper) reportTransferProgress(req *pb.ReplicateRequest, bytesTransferred, totalBytes int64, status pb.TransferStatus, message string, logFailures bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), transferProgressTimeout)
+	defer cancel()
+
+	_, err := dk.master.ReportTransferProgress(ctx, &pb.TransferProgressRequest{
+		TransferId:        req.GetTransferId(),
+		FileName:          req.GetFileName(),
+		SourceNodeId:      dk.id,
+		DestinationNodeId: req.GetDestinationNodeId(),
+		BytesTransferred:  bytesTransferred,
+		TotalBytes:        totalBytes,
+		Status:            status,
+		Message:           message,
+	})
+	if err != nil && logFailures {
+		log.Printf("Failed to report transfer progress for %s to master: %v", req.GetTransferId(), err)
+	}
+}
+
+func (dk *DataKeeper) startReplicationJob(jobKey string) bool {
+	dk.replicationMu.Lock()
+	defer dk.replicationMu.Unlock()
+
+	if _, exists := dk.activeReplications[jobKey]; exists {
+		return false
+	}
+
+	dk.activeReplications[jobKey] = struct{}{}
+	return true
+}
+
+func (dk *DataKeeper) finishReplicationJob(jobKey string) {
+	dk.replicationMu.Lock()
+	delete(dk.activeReplications, jobKey)
+	dk.replicationMu.Unlock()
 }
 
 func (dk *DataKeeper) StartRPCServer(port int32) {
@@ -454,6 +545,90 @@ func configureTCPConn(conn net.Conn) {
 	}
 	_ = tcpConn.SetReadBuffer(socketBufferSize)
 	_ = tcpConn.SetWriteBuffer(socketBufferSize)
+}
+
+func copyExactWithBuffer(destination io.Writer, source io.Reader, totalBytes int64, onProgress func(int64)) (int64, error) {
+	if totalBytes < 0 {
+		return 0, fmt.Errorf("invalid byte count %d", totalBytes)
+	}
+	if totalBytes == 0 {
+		if onProgress != nil {
+			onProgress(0)
+		}
+		return 0, nil
+	}
+
+	buffer := make([]byte, transferBufferSize)
+	limitedSource := io.LimitReader(source, totalBytes)
+	var written int64
+
+	for written < totalBytes {
+		readCount, readErr := limitedSource.Read(buffer)
+		if readCount > 0 {
+			writeCount, writeErr := destination.Write(buffer[:readCount])
+			written += int64(writeCount)
+			if onProgress != nil {
+				onProgress(written)
+			}
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if writeCount != readCount {
+				return written, io.ErrShortWrite
+			}
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return written, readErr
+		}
+	}
+
+	if written != totalBytes {
+		return written, io.ErrUnexpectedEOF
+	}
+
+	return written, nil
+}
+
+type transferReporter struct {
+	callback         func(int64, pb.TransferStatus, string, bool)
+	lastReportedAt   time.Time
+	lastReportedByte int64
+}
+
+func newTransferReporter(callback func(int64, pb.TransferStatus, string, bool)) *transferReporter {
+	return &transferReporter{callback: callback}
+}
+
+func (tr *transferReporter) maybeReport(bytesTransferred int64, status pb.TransferStatus, message string) {
+	if tr.callback == nil {
+		return
+	}
+
+	if bytesTransferred-tr.lastReportedByte < transferProgressStep && time.Since(tr.lastReportedAt) < transferProgressEvery {
+		return
+	}
+
+	tr.report(bytesTransferred, status, message, false)
+}
+
+func (tr *transferReporter) report(bytesTransferred int64, status pb.TransferStatus, message string, logFailures bool) {
+	if tr.callback == nil {
+		return
+	}
+
+	tr.lastReportedByte = bytesTransferred
+	tr.lastReportedAt = time.Now()
+	tr.callback(bytesTransferred, status, message, logFailures)
+}
+
+func (tr *transferReporter) close() {}
+
+func replicationJobKey(fileName, destinationNodeID, transferID string) string {
+	return strings.Join([]string{fileName, destinationNodeID, transferID}, "\x00")
 }
 
 func detectAdvertiseIPv4(masterAddr string) (string, error) {

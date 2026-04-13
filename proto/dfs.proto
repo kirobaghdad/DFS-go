@@ -26,6 +26,9 @@ service MasterTracker {
   // Data Keeper -> Master Tracker: report local files on startup.
   rpc ReportFiles(ReportFilesRequest) returns (ReportFilesResponse);
 
+  // Data Keeper -> Master Tracker: report replication transfer progress.
+  rpc ReportTransferProgress(TransferProgressRequest) returns (TransferProgressResponse);
+
   // Optional extension: delete a file across the cluster.
   rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
 
@@ -120,11 +123,14 @@ message NotifyUploadResponse {
 }
 
 message ReplicateRequest {
-  string file_name = 1;
-  string source_ip = 2;
-  int32 source_port = 3;
-  string destination_ip = 4;
-  int32 destination_port = 5;
+  string transfer_id = 1;
+  string source_node_id = 2;
+  string destination_node_id = 3;
+  string file_name = 4;
+  string source_ip = 5;
+  int32 source_port = 6;
+  string destination_ip = 7;
+  int32 destination_port = 8;
 }
 
 message ReplicateResponse {
@@ -143,6 +149,30 @@ message FileInfo {
 }
 
 message ReportFilesResponse {
+  bool success = 1;
+}
+
+enum TransferStatus {
+  TRANSFER_STATUS_UNKNOWN = 0;
+  TRANSFER_STATUS_QUEUED = 1;
+  TRANSFER_STATUS_RUNNING = 2;
+  TRANSFER_STATUS_AWAITING_CONFIRMATION = 3;
+  TRANSFER_STATUS_COMPLETED = 4;
+  TRANSFER_STATUS_FAILED = 5;
+}
+
+message TransferProgressRequest {
+  string transfer_id = 1;
+  string file_name = 2;
+  string source_node_id = 3;
+  string destination_node_id = 4;
+  int64 bytes_transferred = 5;
+  int64 total_bytes = 6;
+  TransferStatus status = 7;
+  string message = 8;
+}
+
+message TransferProgressResponse {
   bool success = 1;
 }
 

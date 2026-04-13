@@ -30,9 +30,19 @@ const (
 	heartbeatGracePeriod    = 5 * time.Second
 	heartbeatMonitorEvery   = 1 * time.Second
 	replicationCheckEvery   = 10 * time.Second
-	masterRPCDialTimeout    = 3 * time.Second
+	masterRPCDialTimeout    = 10 * time.Second
 	completedUploadRetain   = 1 * time.Minute
+	completedTransferRetain = 1 * time.Minute
+	stalledTransferTimeout  = 2 * time.Minute
 	supportedUploadFileType = ".mp4"
+	maxDashboardTransfers   = 12
+
+	transferStatusUnknown              = "Unknown"
+	transferStatusQueued               = "Queued"
+	transferStatusRunning              = "Running"
+	transferStatusAwaitingConfirmation = "Awaiting Confirmation"
+	transferStatusCompleted            = "Completed"
+	transferStatusFailed               = "Failed"
 )
 
 type FileRecord struct {
@@ -85,38 +95,61 @@ type ClusterMetrics struct {
 	TotalNodes             int `json:"total_nodes"`
 	DesiredReplicaCount    int `json:"desired_replica_count"`
 	TotalFiles             int `json:"total_files"`
+	ActiveTransfers        int `json:"active_transfers"`
 	FullyReplicatedFiles   int `json:"fully_replicated_files"`
 	UnderReplicatedFiles   int `json:"under_replicated_files"`
 	FilesWithAliveReplica  int `json:"files_with_alive_replica"`
 	FilesWithoutAliveNodes int `json:"files_without_alive_nodes"`
 }
 
+type TransferProgress struct {
+	TransferID        string    `json:"transfer_id"`
+	FileName          string    `json:"file_name"`
+	SourceNodeID      string    `json:"source_node_id"`
+	DestinationNodeID string    `json:"destination_node_id"`
+	BytesTransferred  int64     `json:"bytes_transferred"`
+	TotalBytes        int64     `json:"total_bytes"`
+	Status            string    `json:"status"`
+	Message           string    `json:"message"`
+	StartedAt         time.Time `json:"started_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	PercentComplete   float64   `json:"percent_complete"`
+	Active            bool      `json:"active"`
+}
+
 type DashboardStatus struct {
-	Nodes   []NodeStatus   `json:"nodes"`
-	Files   []FileHealth   `json:"files"`
-	Metrics ClusterMetrics `json:"metrics"`
+	Nodes     []NodeStatus       `json:"nodes"`
+	Files     []FileHealth       `json:"files"`
+	Transfers []TransferProgress `json:"transfers"`
+	Metrics   ClusterMetrics     `json:"metrics"`
 }
 
 type replicationTask struct {
-	FileName string
-	Source   NodeStatus
-	Dest     NodeStatus
+	TransferID string
+	FileName   string
+	FileSize   int64
+	Source     NodeStatus
+	Dest       NodeStatus
 }
 
 type MasterTrackerServer struct {
 	pb.UnimplementedMasterTrackerServer
 
-	mu             sync.RWMutex
-	fileIndex      map[string]map[string]FileRecord
-	nodes          map[string]*NodeStatus
-	pendingUploads map[string]*UploadSession
+	mu              sync.RWMutex
+	fileIndex       map[string]map[string]FileRecord
+	nodes           map[string]*NodeStatus
+	pendingUploads  map[string]*UploadSession
+	transfers       map[string]*TransferProgress
+	activeTransfers map[string]string
 }
 
 func NewMasterTrackerServer() *MasterTrackerServer {
 	return &MasterTrackerServer{
-		fileIndex:      make(map[string]map[string]FileRecord),
-		nodes:          make(map[string]*NodeStatus),
-		pendingUploads: make(map[string]*UploadSession),
+		fileIndex:       make(map[string]map[string]FileRecord),
+		nodes:           make(map[string]*NodeStatus),
+		pendingUploads:  make(map[string]*UploadSession),
+		transfers:       make(map[string]*TransferProgress),
+		activeTransfers: make(map[string]string),
 	}
 }
 
@@ -281,6 +314,50 @@ func (s *MasterTrackerServer) ListFiles(ctx context.Context, req *pb.ListFilesRe
 	return &pb.ListFilesResponse{Files: files}, nil
 }
 
+func (s *MasterTrackerServer) ReportTransferProgress(ctx context.Context, req *pb.TransferProgressRequest) (*pb.TransferProgressResponse, error) {
+	transferID := strings.TrimSpace(req.GetTransferId())
+	if transferID == "" {
+		return nil, status.Error(codes.InvalidArgument, "transfer_id is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	transfer, exists := s.transfers[transferID]
+	if !exists {
+		return nil, status.Error(codes.NotFound, "transfer not found")
+	}
+
+	if req.GetFileName() != "" {
+		transfer.FileName = req.GetFileName()
+	}
+	if req.GetSourceNodeId() != "" {
+		transfer.SourceNodeID = req.GetSourceNodeId()
+	}
+	if req.GetDestinationNodeId() != "" {
+		transfer.DestinationNodeID = req.GetDestinationNodeId()
+	}
+	if req.GetTotalBytes() > 0 {
+		transfer.TotalBytes = req.GetTotalBytes()
+	}
+	if req.GetBytesTransferred() > transfer.BytesTransferred {
+		transfer.BytesTransferred = req.GetBytesTransferred()
+	}
+	transfer.Message = strings.TrimSpace(req.GetMessage())
+	transfer.Status = transferStatusLabel(req.GetStatus())
+	transfer.Active = !isTransferTerminal(transfer.Status)
+	transfer.UpdatedAt = time.Now()
+	if transfer.TotalBytes > 0 {
+		transfer.PercentComplete = minFloat64(float64(transfer.BytesTransferred)*100/float64(transfer.TotalBytes), 100)
+	}
+
+	if transfer.Status == transferStatusFailed {
+		delete(s.activeTransfers, replicationKey(transfer.FileName, transfer.DestinationNodeID))
+	}
+
+	return &pb.TransferProgressResponse{Success: true}, nil
+}
+
 func (s *MasterTrackerServer) NotifyUpload(ctx context.Context, req *pb.NotifyUploadRequest) (*pb.NotifyUploadResponse, error) {
 	fileName := strings.TrimSpace(req.GetFileName())
 	nodeID := strings.TrimSpace(req.GetNodeId())
@@ -317,6 +394,10 @@ func (s *MasterTrackerServer) NotifyUpload(ctx context.Context, req *pb.NotifyUp
 		FilePath: req.GetFilePath(),
 		FileSize: req.GetFileSize(),
 	})
+
+	if uploadID := strings.TrimSpace(req.GetUploadId()); uploadID == "" {
+		s.markReplicationConfirmedLocked(fileName, nodeID, req.GetFileSize())
+	}
 
 	if uploadID := strings.TrimSpace(req.GetUploadId()); uploadID != "" {
 		session, exists := s.pendingUploads[uploadID]
@@ -407,6 +488,7 @@ func (s *MasterTrackerServer) MonitorNodes() {
 			}
 		}
 		s.cleanupUploadSessionsLocked(now)
+		s.cleanupTransfersLocked(now)
 		s.mu.Unlock()
 	}
 }
@@ -497,8 +579,11 @@ func (s *MasterTrackerServer) removeNodeRecordsLocked(nodeID string) {
 }
 
 func (s *MasterTrackerServer) buildReplicationTasks() []replicationTask {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	s.cleanupTransfersLocked(now)
 
 	aliveNodes := make([]NodeStatus, 0, len(s.nodes))
 	for _, node := range s.nodes {
@@ -528,7 +613,9 @@ func (s *MasterTrackerServer) buildReplicationTasks() []replicationTask {
 	for _, fileName := range fileNames {
 		holders := s.fileIndex[fileName]
 		aliveHolderIDs := make([]string, 0, len(holders))
+		var fileSize int64
 		for nodeID := range holders {
+			fileSize = holders[nodeID].FileSize
 			if node, exists := s.nodes[nodeID]; exists && node.IsAlive {
 				aliveHolderIDs = append(aliveHolderIDs, nodeID)
 			}
@@ -553,7 +640,18 @@ func (s *MasterTrackerServer) buildReplicationTasks() []replicationTask {
 		for _, nodeID := range aliveHolderIDs {
 			plannedHolders[nodeID] = true
 		}
+		for _, transfer := range s.transfers {
+			if transfer.FileName != fileName || !transfer.Active {
+				continue
+			}
+			plannedHolders[transfer.DestinationNodeID] = true
+		}
 
+		if len(plannedHolders) >= targetReplicaCount {
+			continue
+		}
+
+		scheduledCount := 0
 		for _, candidate := range aliveNodes {
 			if len(plannedHolders) >= targetReplicaCount {
 				break
@@ -561,15 +659,38 @@ func (s *MasterTrackerServer) buildReplicationTasks() []replicationTask {
 			if plannedHolders[candidate.NodeID] {
 				continue
 			}
+			transferID, err := newTransferID()
+			if err != nil {
+				log.Printf("Failed to create transfer ID for %s -> %s: %v", fileName, candidate.NodeID, err)
+				continue
+			}
 			plannedHolders[candidate.NodeID] = true
+			s.transfers[transferID] = &TransferProgress{
+				TransferID:        transferID,
+				FileName:          fileName,
+				SourceNodeID:      sourceNode.NodeID,
+				DestinationNodeID: candidate.NodeID,
+				TotalBytes:        fileSize,
+				Status:            transferStatusQueued,
+				Message:           "queued by master",
+				StartedAt:         now,
+				UpdatedAt:         now,
+				Active:            true,
+			}
+			s.activeTransfers[replicationKey(fileName, candidate.NodeID)] = transferID
 			tasks = append(tasks, replicationTask{
-				FileName: fileName,
-				Source:   sourceNode,
-				Dest:     candidate,
+				TransferID: transferID,
+				FileName:   fileName,
+				FileSize:   fileSize,
+				Source:     sourceNode,
+				Dest:       candidate,
 			})
+			scheduledCount++
 		}
 
-		log.Printf("Replication planner scheduled %d new copy/copies for %s (%d alive replica(s), %d alive keeper(s))", len(plannedHolders)-len(aliveHolderIDs), fileName, len(aliveHolderIDs), len(aliveNodes))
+		if scheduledCount > 0 {
+			log.Printf("Replication planner scheduled %d new copy/copies for %s (%d alive replica(s), %d alive keeper(s))", scheduledCount, fileName, len(aliveHolderIDs), len(aliveNodes))
+		}
 	}
 
 	return tasks
@@ -584,6 +705,9 @@ func (s *MasterTrackerServer) callReplicate(task replicationTask) {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
+		s.mu.Lock()
+		s.markTransferFailedLocked(task.TransferID, fmt.Sprintf("failed to connect to source keeper %s: %v", task.Source.NodeID, err))
+		s.mu.Unlock()
 		log.Printf("Failed to connect to source keeper %s: %v", task.Source.NodeID, err)
 		return
 	}
@@ -591,13 +715,19 @@ func (s *MasterTrackerServer) callReplicate(task replicationTask) {
 
 	client := pb.NewDataKeeperClient(conn)
 	_, err = client.Replicate(ctx, &pb.ReplicateRequest{
-		FileName:        task.FileName,
-		SourceIp:        task.Source.IP,
-		SourcePort:      task.Source.Port,
-		DestinationIp:   task.Dest.IP,
-		DestinationPort: task.Dest.Port,
+		TransferId:        task.TransferID,
+		SourceNodeId:      task.Source.NodeID,
+		DestinationNodeId: task.Dest.NodeID,
+		FileName:          task.FileName,
+		SourceIp:          task.Source.IP,
+		SourcePort:        task.Source.Port,
+		DestinationIp:     task.Dest.IP,
+		DestinationPort:   task.Dest.Port,
 	})
 	if err != nil {
+		s.mu.Lock()
+		s.markTransferFailedLocked(task.TransferID, fmt.Sprintf("replication RPC to %s failed: %v", task.Source.NodeID, err))
+		s.mu.Unlock()
 		log.Printf("Failed to replicate %s from %s to %s: %v", task.FileName, task.Source.NodeID, task.Dest.NodeID, err)
 		return
 	}
@@ -681,10 +811,12 @@ func (s *MasterTrackerServer) buildDashboardStatusLocked() DashboardStatus {
 	})
 
 	files := s.buildFileHealthLocked()
+	transfers := s.buildTransferSnapshotLocked()
 	metrics := ClusterMetrics{
 		DesiredReplicaCount: desiredReplicaCount,
 		TotalNodes:          len(nodes),
 		TotalFiles:          len(files),
+		ActiveTransfers:     s.countActiveTransfersLocked(),
 	}
 
 	for _, node := range nodes {
@@ -707,9 +839,10 @@ func (s *MasterTrackerServer) buildDashboardStatusLocked() DashboardStatus {
 	}
 
 	return DashboardStatus{
-		Nodes:   nodes,
-		Files:   files,
-		Metrics: metrics,
+		Nodes:     nodes,
+		Files:     files,
+		Transfers: transfers,
+		Metrics:   metrics,
 	}
 }
 
@@ -773,6 +906,92 @@ func (s *MasterTrackerServer) cleanupUploadSessionsLocked(now time.Time) {
 	}
 }
 
+func (s *MasterTrackerServer) cleanupTransfersLocked(now time.Time) {
+	for transferID, transfer := range s.transfers {
+		if transfer.Active {
+			if now.Sub(transfer.UpdatedAt) > stalledTransferTimeout {
+				transfer.Active = false
+				transfer.Status = transferStatusFailed
+				if transfer.Message == "" {
+					transfer.Message = "transfer stalled before the destination confirmed the copy"
+				}
+				delete(s.activeTransfers, replicationKey(transfer.FileName, transfer.DestinationNodeID))
+			}
+			continue
+		}
+
+		if now.Sub(transfer.UpdatedAt) > completedTransferRetain {
+			delete(s.transfers, transferID)
+		}
+	}
+}
+
+func (s *MasterTrackerServer) buildTransferSnapshotLocked() []TransferProgress {
+	transferIDs := mapsKeys(s.transfers)
+	slices.SortFunc(transferIDs, func(left, right string) int {
+		leftTransfer := s.transfers[left]
+		rightTransfer := s.transfers[right]
+
+		switch {
+		case leftTransfer.Active && !rightTransfer.Active:
+			return -1
+		case !leftTransfer.Active && rightTransfer.Active:
+			return 1
+		case leftTransfer.UpdatedAt.After(rightTransfer.UpdatedAt):
+			return -1
+		case leftTransfer.UpdatedAt.Before(rightTransfer.UpdatedAt):
+			return 1
+		default:
+			return strings.Compare(leftTransfer.TransferID, rightTransfer.TransferID)
+		}
+	})
+
+	transfers := make([]TransferProgress, 0, minInt(len(transferIDs), maxDashboardTransfers))
+	for _, transferID := range transferIDs {
+		transfers = append(transfers, *s.transfers[transferID])
+		if len(transfers) >= maxDashboardTransfers {
+			break
+		}
+	}
+
+	return transfers
+}
+
+func (s *MasterTrackerServer) markReplicationConfirmedLocked(fileName, destinationNodeID string, fileSize int64) {
+	transferID, exists := s.activeTransfers[replicationKey(fileName, destinationNodeID)]
+	if !exists {
+		return
+	}
+
+	transfer, exists := s.transfers[transferID]
+	if !exists {
+		delete(s.activeTransfers, replicationKey(fileName, destinationNodeID))
+		return
+	}
+
+	transfer.BytesTransferred = maxInt64(transfer.BytesTransferred, fileSize)
+	transfer.TotalBytes = maxInt64(transfer.TotalBytes, fileSize)
+	transfer.PercentComplete = 100
+	transfer.Status = transferStatusCompleted
+	transfer.Message = fmt.Sprintf("master confirmed %s on %s", fileName, destinationNodeID)
+	transfer.UpdatedAt = time.Now()
+	transfer.Active = false
+	delete(s.activeTransfers, replicationKey(fileName, destinationNodeID))
+}
+
+func (s *MasterTrackerServer) markTransferFailedLocked(transferID, message string) {
+	transfer, exists := s.transfers[transferID]
+	if !exists {
+		return
+	}
+
+	transfer.Status = transferStatusFailed
+	transfer.Message = message
+	transfer.UpdatedAt = time.Now()
+	transfer.Active = false
+	delete(s.activeTransfers, replicationKey(transfer.FileName, transfer.DestinationNodeID))
+}
+
 func (s *UploadSession) finish(success bool, message string) {
 	if !s.CompletedAt.IsZero() {
 		return
@@ -789,6 +1008,10 @@ func newUploadID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buffer), nil
+}
+
+func newTransferID() (string, error) {
+	return newUploadID()
 }
 
 func mapsKeys[T any](input map[string]T) []string {
@@ -811,6 +1034,55 @@ func maxInt(left, right int) int {
 		return left
 	}
 	return right
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func minFloat64(left, right float64) float64 {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func (s *MasterTrackerServer) countActiveTransfersLocked() int {
+	count := 0
+	for _, transfer := range s.transfers {
+		if transfer.Active {
+			count++
+		}
+	}
+	return count
+}
+
+func replicationKey(fileName, destinationNodeID string) string {
+	return fileName + "\x00" + destinationNodeID
+}
+
+func transferStatusLabel(status pb.TransferStatus) string {
+	switch status {
+	case pb.TransferStatus_TRANSFER_STATUS_QUEUED:
+		return transferStatusQueued
+	case pb.TransferStatus_TRANSFER_STATUS_RUNNING:
+		return transferStatusRunning
+	case pb.TransferStatus_TRANSFER_STATUS_AWAITING_CONFIRMATION:
+		return transferStatusAwaitingConfirmation
+	case pb.TransferStatus_TRANSFER_STATUS_COMPLETED:
+		return transferStatusCompleted
+	case pb.TransferStatus_TRANSFER_STATUS_FAILED:
+		return transferStatusFailed
+	default:
+		return transferStatusUnknown
+	}
+}
+
+func isTransferTerminal(status string) bool {
+	return status == transferStatusCompleted || status == transferStatusFailed
 }
 
 func main() {

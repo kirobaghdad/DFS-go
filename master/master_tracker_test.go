@@ -52,10 +52,51 @@ func TestBuildReplicationTasksSchedulesAllMissingCopiesInOnePass(t *testing.T) {
 		if task.Source.NodeID != "node1" {
 			t.Fatalf("expected node1 to be the source, got %s", task.Source.NodeID)
 		}
+		if task.TransferID == "" {
+			t.Fatalf("expected replication task to reserve a transfer ID")
+		}
 	}
 
 	if !destinations["node2"] || !destinations["node3"] {
 		t.Fatalf("expected tasks for node2 and node3, got %+v", destinations)
+	}
+}
+
+func TestBuildReplicationTasksSkipsDestinationWithActiveTransfer(t *testing.T) {
+	server := NewMasterTrackerServer()
+	now := time.Now()
+
+	server.nodes["node1"] = &NodeStatus{NodeID: "node1", IP: "10.0.0.1", Port: 7001, IsAlive: true, LastSeen: now}
+	server.nodes["node2"] = &NodeStatus{NodeID: "node2", IP: "10.0.0.2", Port: 7002, IsAlive: true, LastSeen: now}
+	server.nodes["node3"] = &NodeStatus{NodeID: "node3", IP: "10.0.0.3", Port: 7003, IsAlive: true, LastSeen: now}
+	server.upsertFileRecordLocked(FileRecord{
+		FileName: "video.mp4",
+		NodeID:   "node1",
+		FilePath: "data_node1/video.mp4",
+		FileSize: 32,
+	})
+
+	server.transfers["transfer-1"] = &TransferProgress{
+		TransferID:        "transfer-1",
+		FileName:          "video.mp4",
+		SourceNodeID:      "node1",
+		DestinationNodeID: "node2",
+		BytesTransferred:  16,
+		TotalBytes:        32,
+		Status:            transferStatusRunning,
+		Message:           "in progress",
+		StartedAt:         now,
+		UpdatedAt:         now,
+		Active:            true,
+	}
+	server.activeTransfers[replicationKey("video.mp4", "node2")] = "transfer-1"
+
+	tasks := server.buildReplicationTasks()
+	if len(tasks) != 1 {
+		t.Fatalf("expected one remaining replication task, got %d", len(tasks))
+	}
+	if tasks[0].Dest.NodeID != "node3" {
+		t.Fatalf("expected node3 to be scheduled next, got %s", tasks[0].Dest.NodeID)
 	}
 }
 
@@ -129,5 +170,56 @@ func TestNotifyUploadRejectsIncompleteClientTransfer(t *testing.T) {
 	}
 	if records := server.fileIndex["video.mp4"]; len(records) != 0 {
 		t.Fatalf("expected incomplete upload to stay out of file index")
+	}
+}
+
+func TestNotifyUploadMarksReplicationCompleted(t *testing.T) {
+	server := NewMasterTrackerServer()
+	now := time.Now()
+	server.nodes["node1"] = &NodeStatus{NodeID: "node1", IP: "10.0.0.1", Port: 7001, IsAlive: true, LastSeen: now}
+	server.nodes["node2"] = &NodeStatus{NodeID: "node2", IP: "10.0.0.2", Port: 7002, IsAlive: true, LastSeen: now}
+	server.upsertFileRecordLocked(FileRecord{
+		FileName: "video.mp4",
+		NodeID:   "node1",
+		FilePath: "data_node1/video.mp4",
+		FileSize: 32,
+	})
+	server.transfers["transfer-1"] = &TransferProgress{
+		TransferID:        "transfer-1",
+		FileName:          "video.mp4",
+		SourceNodeID:      "node1",
+		DestinationNodeID: "node2",
+		BytesTransferred:  32,
+		TotalBytes:        32,
+		Status:            transferStatusAwaitingConfirmation,
+		Message:           "waiting for destination confirmation",
+		StartedAt:         now,
+		UpdatedAt:         now,
+		Active:            true,
+	}
+	server.activeTransfers[replicationKey("video.mp4", "node2")] = "transfer-1"
+
+	_, err := server.NotifyUpload(context.Background(), &pb.NotifyUploadRequest{
+		FileName: "video.mp4",
+		NodeId:   "node2",
+		FilePath: "data_node2/video.mp4",
+		FileSize: 32,
+	})
+	if err != nil {
+		t.Fatalf("expected replication notify to succeed: %v", err)
+	}
+
+	transfer := server.transfers["transfer-1"]
+	if transfer == nil {
+		t.Fatalf("expected transfer state to remain available")
+	}
+	if transfer.Active {
+		t.Fatalf("expected transfer to become inactive after confirmation")
+	}
+	if transfer.Status != transferStatusCompleted {
+		t.Fatalf("expected transfer to be completed, got %s", transfer.Status)
+	}
+	if _, exists := server.activeTransfers[replicationKey("video.mp4", "node2")]; exists {
+		t.Fatalf("expected active transfer key to be cleared")
 	}
 }

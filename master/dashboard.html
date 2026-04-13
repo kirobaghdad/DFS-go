@@ -247,6 +247,35 @@
             color: var(--danger);
         }
 
+        .transfer-meta {
+            display: grid;
+            gap: 0.5rem;
+            width: 100%;
+        }
+
+        .progress-track {
+            width: 100%;
+            height: 0.62rem;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.08);
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, var(--cyan), var(--teal));
+            transition: width 180ms ease;
+        }
+
+        .progress-fill.warn {
+            background: linear-gradient(90deg, #ffb44d, #f6c35f);
+        }
+
+        .progress-fill.down {
+            background: linear-gradient(90deg, #ff6b7a, #ff9f6b);
+        }
+
         .empty {
             padding: 1rem;
             border-radius: 16px;
@@ -315,6 +344,11 @@
                 <div class="summary-value" id="under-replicated">0</div>
                 <div class="summary-detail">Files still readable but below the required replica count.</div>
             </div>
+            <div class="summary-card">
+                <div class="summary-label">Active Transfers</div>
+                <div class="summary-value" id="active-transfers">0</div>
+                <div class="summary-detail">Replica copies currently moving between data keepers.</div>
+            </div>
         </section>
 
         <section class="dashboard-grid">
@@ -332,6 +366,14 @@
                     <div class="panel-note">Assignment target: 3 alive replicas per file</div>
                 </div>
                 <ul id="health-list" class="list"></ul>
+            </article>
+
+            <article class="panel full">
+                <div class="panel-header">
+                    <div class="panel-title">Transfer Monitor</div>
+                    <div class="panel-note">Live replica-copy progress plus the most recent transfer outcomes.</div>
+                </div>
+                <ul id="transfer-list" class="list"></ul>
             </article>
 
             <article class="panel full">
@@ -357,6 +399,26 @@
             return file.fully_replicated ? 'ok' : 'warn';
         }
 
+        function badgeClassForTransfer(transfer) {
+            if (transfer.status === 'Completed') {
+                return 'ok';
+            }
+            if (transfer.status === 'Failed') {
+                return 'down';
+            }
+            return 'warn';
+        }
+
+        function progressClassForTransfer(transfer) {
+            if (transfer.status === 'Failed') {
+                return 'down';
+            }
+            if (transfer.status === 'Completed') {
+                return '';
+            }
+            return 'warn';
+        }
+
         async function updateDashboard() {
             try {
                 const response = await fetch('/api/status');
@@ -367,6 +429,7 @@
                 document.getElementById('tracked-files').innerText = `${metrics.total_files || 0}`;
                 document.getElementById('health-score').innerText = `${metrics.fully_replicated_files || 0} / ${metrics.total_files || 0}`;
                 document.getElementById('under-replicated').innerText = `${metrics.under_replicated_files || 0}`;
+                document.getElementById('active-transfers').innerText = `${metrics.active_transfers || 0}`;
                 document.getElementById('last-update').innerText = new Date().toLocaleTimeString();
 
                 const note = (metrics.alive_nodes || 0) < (metrics.desired_replica_count || 3)
@@ -376,6 +439,7 @@
 
                 const nodes = data.nodes || [];
                 const files = data.files || [];
+                const transfers = data.transfers || [];
 
                 const nodeList = document.getElementById('node-list');
                 nodeList.innerHTML = '';
@@ -415,6 +479,33 @@
                             </div>
                         `;
                         healthList.appendChild(item);
+                    });
+                }
+
+                const transferList = document.getElementById('transfer-list');
+                transferList.innerHTML = '';
+                if (!transfers.length) {
+                    renderEmpty('transfer-list', 'Replica copies will appear here once the master starts balancing files across nodes.');
+                } else {
+                    transfers.forEach(transfer => {
+                        const progress = Math.max(0, Math.min(100, Number(transfer.percent_complete || 0))).toFixed(1);
+                        const item = document.createElement('li');
+                        item.className = 'item';
+                        item.innerHTML = `
+                            <div class="transfer-meta">
+                                <div class="name mono">${transfer.file_name}</div>
+                                <div class="subtext">${transfer.source_node_id} -> ${transfer.destination_node_id}</div>
+                                <div class="subtext">${transfer.message || 'Waiting for an update from the source node.'}</div>
+                                <div class="subtext mono">${transfer.bytes_transferred || 0} / ${transfer.total_bytes || 0} byte(s)</div>
+                                <div class="progress-track">
+                                    <div class="progress-fill ${progressClassForTransfer(transfer)}" style="width: ${progress}%"></div>
+                                </div>
+                            </div>
+                            <div class="badge ${badgeClassForTransfer(transfer)}">
+                                ${transfer.status} ${progress}%
+                            </div>
+                        `;
+                        transferList.appendChild(item);
                     });
                 }
 

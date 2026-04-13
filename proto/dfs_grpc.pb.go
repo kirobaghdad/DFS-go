@@ -19,15 +19,16 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	MasterTracker_Heartbeat_FullMethodName       = "/dfs.MasterTracker/Heartbeat"
-	MasterTracker_RequestUpload_FullMethodName   = "/dfs.MasterTracker/RequestUpload"
-	MasterTracker_WaitForUpload_FullMethodName   = "/dfs.MasterTracker/WaitForUpload"
-	MasterTracker_RequestDownload_FullMethodName = "/dfs.MasterTracker/RequestDownload"
-	MasterTracker_ListFiles_FullMethodName       = "/dfs.MasterTracker/ListFiles"
-	MasterTracker_NotifyUpload_FullMethodName    = "/dfs.MasterTracker/NotifyUpload"
-	MasterTracker_ReportFiles_FullMethodName     = "/dfs.MasterTracker/ReportFiles"
-	MasterTracker_DeleteFile_FullMethodName      = "/dfs.MasterTracker/DeleteFile"
-	MasterTracker_DeleteAllFiles_FullMethodName  = "/dfs.MasterTracker/DeleteAllFiles"
+	MasterTracker_Heartbeat_FullMethodName              = "/dfs.MasterTracker/Heartbeat"
+	MasterTracker_RequestUpload_FullMethodName          = "/dfs.MasterTracker/RequestUpload"
+	MasterTracker_WaitForUpload_FullMethodName          = "/dfs.MasterTracker/WaitForUpload"
+	MasterTracker_RequestDownload_FullMethodName        = "/dfs.MasterTracker/RequestDownload"
+	MasterTracker_ListFiles_FullMethodName              = "/dfs.MasterTracker/ListFiles"
+	MasterTracker_NotifyUpload_FullMethodName           = "/dfs.MasterTracker/NotifyUpload"
+	MasterTracker_ReportFiles_FullMethodName            = "/dfs.MasterTracker/ReportFiles"
+	MasterTracker_ReportTransferProgress_FullMethodName = "/dfs.MasterTracker/ReportTransferProgress"
+	MasterTracker_DeleteFile_FullMethodName             = "/dfs.MasterTracker/DeleteFile"
+	MasterTracker_DeleteAllFiles_FullMethodName         = "/dfs.MasterTracker/DeleteAllFiles"
 )
 
 // MasterTrackerClient is the client API for MasterTracker service.
@@ -48,6 +49,8 @@ type MasterTrackerClient interface {
 	NotifyUpload(ctx context.Context, in *NotifyUploadRequest, opts ...grpc.CallOption) (*NotifyUploadResponse, error)
 	// Data Keeper -> Master Tracker: report local files on startup.
 	ReportFiles(ctx context.Context, in *ReportFilesRequest, opts ...grpc.CallOption) (*ReportFilesResponse, error)
+	// Data Keeper -> Master Tracker: report replication transfer progress.
+	ReportTransferProgress(ctx context.Context, in *TransferProgressRequest, opts ...grpc.CallOption) (*TransferProgressResponse, error)
 	// Optional extension: delete a file across the cluster.
 	DeleteFile(ctx context.Context, in *DeleteFileRequest, opts ...grpc.CallOption) (*DeleteFileResponse, error)
 	// Optional extension: wipe all files across the cluster.
@@ -125,6 +128,15 @@ func (c *masterTrackerClient) ReportFiles(ctx context.Context, in *ReportFilesRe
 	return out, nil
 }
 
+func (c *masterTrackerClient) ReportTransferProgress(ctx context.Context, in *TransferProgressRequest, opts ...grpc.CallOption) (*TransferProgressResponse, error) {
+	out := new(TransferProgressResponse)
+	err := c.cc.Invoke(ctx, MasterTracker_ReportTransferProgress_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *masterTrackerClient) DeleteFile(ctx context.Context, in *DeleteFileRequest, opts ...grpc.CallOption) (*DeleteFileResponse, error) {
 	out := new(DeleteFileResponse)
 	err := c.cc.Invoke(ctx, MasterTracker_DeleteFile_FullMethodName, in, out, opts...)
@@ -161,6 +173,8 @@ type MasterTrackerServer interface {
 	NotifyUpload(context.Context, *NotifyUploadRequest) (*NotifyUploadResponse, error)
 	// Data Keeper -> Master Tracker: report local files on startup.
 	ReportFiles(context.Context, *ReportFilesRequest) (*ReportFilesResponse, error)
+	// Data Keeper -> Master Tracker: report replication transfer progress.
+	ReportTransferProgress(context.Context, *TransferProgressRequest) (*TransferProgressResponse, error)
 	// Optional extension: delete a file across the cluster.
 	DeleteFile(context.Context, *DeleteFileRequest) (*DeleteFileResponse, error)
 	// Optional extension: wipe all files across the cluster.
@@ -192,6 +206,9 @@ func (UnimplementedMasterTrackerServer) NotifyUpload(context.Context, *NotifyUpl
 }
 func (UnimplementedMasterTrackerServer) ReportFiles(context.Context, *ReportFilesRequest) (*ReportFilesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReportFiles not implemented")
+}
+func (UnimplementedMasterTrackerServer) ReportTransferProgress(context.Context, *TransferProgressRequest) (*TransferProgressResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReportTransferProgress not implemented")
 }
 func (UnimplementedMasterTrackerServer) DeleteFile(context.Context, *DeleteFileRequest) (*DeleteFileResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteFile not implemented")
@@ -338,6 +355,24 @@ func _MasterTracker_ReportFiles_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MasterTracker_ReportTransferProgress_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TransferProgressRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MasterTrackerServer).ReportTransferProgress(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MasterTracker_ReportTransferProgress_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MasterTrackerServer).ReportTransferProgress(ctx, req.(*TransferProgressRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MasterTracker_DeleteFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DeleteFileRequest)
 	if err := dec(in); err != nil {
@@ -408,6 +443,10 @@ var MasterTracker_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportFiles",
 			Handler:    _MasterTracker_ReportFiles_Handler,
+		},
+		{
+			MethodName: "ReportTransferProgress",
+			Handler:    _MasterTracker_ReportTransferProgress_Handler,
 		},
 		{
 			MethodName: "DeleteFile",
