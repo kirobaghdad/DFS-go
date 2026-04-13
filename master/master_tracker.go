@@ -42,6 +42,7 @@ const (
 	transferStatusRunning              = "Running"
 	transferStatusAwaitingConfirmation = "Awaiting Confirmation"
 	transferStatusCompleted            = "Completed"
+	transferStatusCanceled             = "Canceled"
 	transferStatusFailed               = "Failed"
 )
 
@@ -333,6 +334,14 @@ func (s *MasterTrackerServer) ReportTransferProgress(ctx context.Context, req *p
 	if !exists {
 		return nil, status.Error(codes.NotFound, "transfer not found")
 	}
+	if transfer.Status == transferStatusCanceled {
+		return &pb.TransferProgressResponse{Success: true}, nil
+	}
+
+	incomingStatus := transferStatusLabel(req.GetStatus())
+	if isTransferTerminal(transfer.Status) && !isTransferTerminal(incomingStatus) {
+		return &pb.TransferProgressResponse{Success: true}, nil
+	}
 
 	if req.GetFileName() != "" {
 		transfer.FileName = req.GetFileName()
@@ -352,7 +361,7 @@ func (s *MasterTrackerServer) ReportTransferProgress(ctx context.Context, req *p
 		transfer.BytesTransferred = incomingBytes
 	}
 	transfer.Message = strings.TrimSpace(req.GetMessage())
-	transfer.Status = transferStatusLabel(req.GetStatus())
+	transfer.Status = incomingStatus
 	transfer.Active = !isTransferTerminal(transfer.Status)
 	transfer.UpdatedAt = now
 	if transfer.TotalBytes > 0 {
@@ -421,6 +430,10 @@ func (s *MasterTrackerServer) NotifyUpload(ctx context.Context, req *pb.NotifyUp
 			session.finish(false, fmt.Sprintf("upload incomplete: expected %d byte(s) but received %d", session.FileSize, req.GetFileSize()))
 			return nil, status.Error(codes.FailedPrecondition, "upload size does not match session")
 		}
+	} else {
+		if _, exists := s.activeTransfers[replicationKey(fileName, nodeID)]; !exists {
+			return nil, status.Error(codes.FailedPrecondition, "replication is no longer expected for this file")
+		}
 	}
 
 	s.upsertFileRecordLocked(FileRecord{
@@ -479,6 +492,8 @@ func (s *MasterTrackerServer) DeleteFile(ctx context.Context, req *pb.DeleteFile
 
 	s.mu.Lock()
 	targets := s.collectDeleteTargetsLocked(fileName)
+	targets = appendUniqueNodes(targets, s.cancelPendingUploadsForFileLocked(fileName, "upload canceled because the file was deleted from the cluster")...)
+	targets = appendUniqueNodes(targets, s.cancelTransfersForFileLocked(fileName, "transfer canceled because the file was deleted from the cluster")...)
 	delete(s.fileIndex, fileName)
 	s.mu.Unlock()
 
@@ -498,6 +513,8 @@ func (s *MasterTrackerServer) DeleteAllFiles(ctx context.Context, req *pb.Delete
 			targets = append(targets, *node)
 		}
 	}
+	s.cancelAllPendingUploadsLocked("upload canceled because the cluster was wiped")
+	s.cancelAllTransfersLocked("transfer canceled because the cluster was wiped")
 	s.fileIndex = make(map[string]map[string]FileRecord)
 	s.mu.Unlock()
 
@@ -829,6 +846,79 @@ func (s *MasterTrackerServer) collectDeleteTargetsLocked(fileName string) []Node
 	return targets
 }
 
+func (s *MasterTrackerServer) cancelPendingUploadsForFileLocked(fileName, message string) []NodeStatus {
+	targets := make([]NodeStatus, 0)
+	for _, session := range s.pendingUploads {
+		if session.FileName != fileName || !session.CompletedAt.IsZero() {
+			continue
+		}
+		session.finish(false, message)
+		if node, exists := s.nodes[session.TargetNodeID]; exists {
+			targets = append(targets, *node)
+		}
+	}
+	return targets
+}
+
+func (s *MasterTrackerServer) cancelAllPendingUploadsLocked(message string) {
+	for _, session := range s.pendingUploads {
+		if session.CompletedAt.IsZero() {
+			session.finish(false, message)
+		}
+	}
+}
+
+func (s *MasterTrackerServer) cancelTransfersForFileLocked(fileName, message string) []NodeStatus {
+	targets := make([]NodeStatus, 0)
+	for _, transfer := range s.transfers {
+		if transfer.FileName != fileName || !transfer.Active {
+			continue
+		}
+		transfer.Status = transferStatusCanceled
+		transfer.Message = message
+		transfer.UpdatedAt = time.Now()
+		transfer.Active = false
+		delete(s.activeTransfers, replicationKey(transfer.FileName, transfer.DestinationNodeID))
+		if node, exists := s.nodes[transfer.SourceNodeID]; exists {
+			targets = append(targets, *node)
+		}
+		if node, exists := s.nodes[transfer.DestinationNodeID]; exists {
+			targets = append(targets, *node)
+		}
+	}
+	return targets
+}
+
+func (s *MasterTrackerServer) cancelAllTransfersLocked(message string) {
+	for _, transfer := range s.transfers {
+		if !transfer.Active {
+			continue
+		}
+		transfer.Status = transferStatusCanceled
+		transfer.Message = message
+		transfer.UpdatedAt = time.Now()
+		transfer.Active = false
+		delete(s.activeTransfers, replicationKey(transfer.FileName, transfer.DestinationNodeID))
+	}
+}
+
+func appendUniqueNodes(existing []NodeStatus, additional ...NodeStatus) []NodeStatus {
+	seen := make(map[string]struct{}, len(existing))
+	for _, node := range existing {
+		seen[node.NodeID] = struct{}{}
+	}
+
+	for _, node := range additional {
+		if _, ok := seen[node.NodeID]; ok {
+			continue
+		}
+		seen[node.NodeID] = struct{}{}
+		existing = append(existing, node)
+	}
+
+	return existing
+}
+
 func (s *MasterTrackerServer) buildDashboardStatusLocked() DashboardStatus {
 	nodes := make([]NodeStatus, 0, len(s.nodes))
 	for _, node := range s.nodes {
@@ -1028,6 +1118,9 @@ func (s *MasterTrackerServer) markTransferFailedLocked(transferID, message strin
 	if !exists {
 		return
 	}
+	if transfer.Status == transferStatusCanceled || transfer.Status == transferStatusCompleted {
+		return
+	}
 
 	transfer.Status = transferStatusFailed
 	transfer.Message = message
@@ -1140,7 +1233,7 @@ func transferStatusLabel(status pb.TransferStatus) string {
 }
 
 func isTransferTerminal(status string) bool {
-	return status == transferStatusCompleted || status == transferStatusFailed
+	return status == transferStatusCompleted || status == transferStatusCanceled || status == transferStatusFailed
 }
 
 func main() {

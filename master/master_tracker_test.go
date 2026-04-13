@@ -223,3 +223,66 @@ func TestNotifyUploadMarksReplicationCompleted(t *testing.T) {
 		t.Fatalf("expected active transfer key to be cleared")
 	}
 }
+
+func TestDeleteFileCancelsActiveReplicationAndRejectsLateNotify(t *testing.T) {
+	server := NewMasterTrackerServer()
+	now := time.Now()
+
+	server.nodes["node1"] = &NodeStatus{NodeID: "node1", IP: "10.0.0.1", Port: 7001, IsAlive: true, LastSeen: now}
+	server.nodes["node2"] = &NodeStatus{NodeID: "node2", IP: "10.0.0.2", Port: 7002, IsAlive: true, LastSeen: now}
+	server.upsertFileRecordLocked(FileRecord{
+		FileName: "video.mp4",
+		NodeID:   "node1",
+		FilePath: "data_node1/video.mp4",
+		FileSize: 32,
+	})
+	server.transfers["transfer-1"] = &TransferProgress{
+		TransferID:        "transfer-1",
+		FileName:          "video.mp4",
+		SourceNodeID:      "node1",
+		DestinationNodeID: "node2",
+		BytesTransferred:  16,
+		TotalBytes:        32,
+		Status:            transferStatusRunning,
+		Message:           "in progress",
+		StartedAt:         now,
+		UpdatedAt:         now,
+		Active:            true,
+	}
+	server.activeTransfers[replicationKey("video.mp4", "node2")] = "transfer-1"
+
+	_, err := server.DeleteFile(context.Background(), &pb.DeleteFileRequest{FileName: "video.mp4"})
+	if err != nil {
+		t.Fatalf("expected delete to succeed: %v", err)
+	}
+
+	transfer := server.transfers["transfer-1"]
+	if transfer == nil {
+		t.Fatalf("expected transfer record to remain for dashboard history")
+	}
+	if transfer.Active {
+		t.Fatalf("expected delete to cancel the active transfer")
+	}
+	if transfer.Status != transferStatusCanceled {
+		t.Fatalf("expected transfer to be canceled, got %s", transfer.Status)
+	}
+	if _, exists := server.activeTransfers[replicationKey("video.mp4", "node2")]; exists {
+		t.Fatalf("expected active transfer key to be removed after delete")
+	}
+	if _, exists := server.fileIndex["video.mp4"]; exists {
+		t.Fatalf("expected file to be removed from the master index")
+	}
+
+	_, err = server.NotifyUpload(context.Background(), &pb.NotifyUploadRequest{
+		FileName: "video.mp4",
+		NodeId:   "node2",
+		FilePath: "data_node2/video.mp4",
+		FileSize: 32,
+	})
+	if err == nil {
+		t.Fatalf("expected late replication notify to be rejected after delete")
+	}
+	if _, exists := server.fileIndex["video.mp4"]; exists {
+		t.Fatalf("expected late notify not to re-add the file")
+	}
+}

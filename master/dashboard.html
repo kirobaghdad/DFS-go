@@ -403,14 +403,14 @@
             if (transfer.status === 'Completed') {
                 return 'ok';
             }
-            if (transfer.status === 'Failed') {
+            if (transfer.status === 'Failed' || transfer.status === 'Canceled') {
                 return 'down';
             }
             return 'warn';
         }
 
         function progressClassForTransfer(transfer) {
-            if (transfer.status === 'Failed') {
+            if (transfer.status === 'Failed' || transfer.status === 'Canceled') {
                 return 'down';
             }
             if (transfer.status === 'Completed') {

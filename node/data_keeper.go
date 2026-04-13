@@ -50,8 +50,14 @@ type DataKeeper struct {
 	master     pb.MasterTrackerClient
 	baseDir    string
 
-	replicationMu      sync.Mutex
-	activeReplications map[string]struct{}
+	replicationMu   sync.Mutex
+	activeTransfers map[string]transferHandle
+	transfersByFile map[string]map[string]struct{}
+}
+
+type transferHandle struct {
+	fileName string
+	cancel   context.CancelFunc
 }
 
 func NewDataKeeper(id, ip string, tcpPort int32, masterAddr string, master pb.MasterTrackerClient) *DataKeeper {
@@ -61,13 +67,14 @@ func NewDataKeeper(id, ip string, tcpPort int32, masterAddr string, master pb.Ma
 	}
 
 	return &DataKeeper{
-		id:                 id,
-		ip:                 ip,
-		tcpPort:            tcpPort,
-		masterAddr:         masterAddr,
-		master:             master,
-		baseDir:            baseDir,
-		activeReplications: make(map[string]struct{}),
+		id:              id,
+		ip:              ip,
+		tcpPort:         tcpPort,
+		masterAddr:      masterAddr,
+		master:          master,
+		baseDir:         baseDir,
+		activeTransfers: make(map[string]transferHandle),
+		transfersByFile: make(map[string]map[string]struct{}),
 	}
 }
 
@@ -224,13 +231,25 @@ func (dk *DataKeeper) receiveUpload(uploadID, rawFileName string, expectedSize i
 		return fmt.Errorf("invalid expected size %d", expectedSize)
 	}
 
+	transferCtx, cancel := context.WithCancel(context.Background())
+	transferKey := incomingTransferKey(fileName, uploadID)
+	if !dk.startTransfer(transferKey, fileName, cancel) {
+		cancel()
+		return fmt.Errorf("another transfer for %s is already using key %s", fileName, transferKey)
+	}
+	defer func() {
+		cancel()
+		dk.finishTransfer(transferKey)
+	}()
+	closeTransferOnCancel(transferCtx, source)
+
 	tempPath := filePath + ".part"
 	file, err := os.Create(tempPath)
 	if err != nil {
 		return fmt.Errorf("failed to create %s: %w", tempPath, err)
 	}
 
-	size, err := copyExactWithBuffer(file, source, expectedSize, nil)
+	size, err := copyExactWithBuffer(transferCtx, file, source, expectedSize, nil)
 	closeErr := file.Close()
 	if err != nil {
 		_ = os.Remove(tempPath)
@@ -321,23 +340,28 @@ func (dk *DataKeeper) streamFileRange(rawFileName string, start, length int64, d
 }
 
 func (dk *DataKeeper) DeleteFile(ctx context.Context, req *pb.DeleteFileRequest) (*pb.DeleteFileResponse, error) {
-	_, filePath, err := dk.resolveLocalPath(req.GetFileName())
+	fileName, filePath, err := dk.resolveLocalPath(req.GetFileName())
 	if err != nil {
 		return &pb.DeleteFileResponse{Success: false}, err
 	}
 
-	if err := os.Remove(filePath); err != nil {
-		if os.IsNotExist(err) {
-			return &pb.DeleteFileResponse{Success: true}, nil
-		}
-		return &pb.DeleteFileResponse{Success: false}, err
+	canceled := dk.cancelTransfersForFile(fileName)
+	deleteErr := removeIfExists(filePath)
+	tempErr := removeIfExists(filePath + ".part")
+	if deleteErr != nil {
+		return &pb.DeleteFileResponse{Success: false}, deleteErr
+	}
+	if tempErr != nil {
+		return &pb.DeleteFileResponse{Success: false}, tempErr
 	}
 
-	log.Printf("Deleted local file %s", filepath.Base(filePath))
+	log.Printf("Deleted local file %s and canceled %d in-flight transfer(s)", filepath.Base(filePath), canceled)
 	return &pb.DeleteFileResponse{Success: true}, nil
 }
 
 func (dk *DataKeeper) Wipe(ctx context.Context, req *pb.WipeRequest) (*pb.WipeResponse, error) {
+	canceled := dk.cancelAllTransfers()
+
 	entries, err := os.ReadDir(dk.baseDir)
 	if err != nil {
 		return &pb.WipeResponse{Success: false}, err
@@ -352,7 +376,7 @@ func (dk *DataKeeper) Wipe(ctx context.Context, req *pb.WipeRequest) (*pb.WipeRe
 		}
 	}
 
-	log.Printf("Wiped local storage in %s", dk.baseDir)
+	log.Printf("Wiped local storage in %s and canceled %d in-flight transfer(s)", dk.baseDir, canceled)
 	return &pb.WipeResponse{Success: true}, nil
 }
 
@@ -380,18 +404,21 @@ func (dk *DataKeeper) Replicate(ctx context.Context, req *pb.ReplicateRequest) (
 		return nil, errors.New("transfer_id is required")
 	}
 
+	transferCtx, cancel := context.WithCancel(context.Background())
 	jobKey := replicationJobKey(fileName, req.GetDestinationNodeId(), transferID)
-	if !dk.startReplicationJob(jobKey) {
+	if !dk.startTransfer(jobKey, fileName, cancel) {
+		cancel()
 		log.Printf("Replication for %s to %s is already running locally", fileName, req.GetDestinationNodeId())
 		return &pb.ReplicateResponse{Success: true}, nil
 	}
 
-	go dk.runReplication(jobKey, req, filePath, fileInfo.Size())
+	go dk.runReplication(transferCtx, cancel, jobKey, req, filePath, fileInfo.Size())
 	return &pb.ReplicateResponse{Success: true}, nil
 }
 
-func (dk *DataKeeper) runReplication(jobKey string, req *pb.ReplicateRequest, filePath string, fileSize int64) {
-	defer dk.finishReplicationJob(jobKey)
+func (dk *DataKeeper) runReplication(transferCtx context.Context, cancel context.CancelFunc, jobKey string, req *pb.ReplicateRequest, filePath string, fileSize int64) {
+	defer cancel()
+	defer dk.finishTransfer(jobKey)
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -409,6 +436,7 @@ func (dk *DataKeeper) runReplication(jobKey string, req *pb.ReplicateRequest, fi
 	}
 	defer conn.Close()
 	configureTCPConn(conn)
+	closeTransferOnCancel(transferCtx, conn)
 
 	if _, err := conn.Write([]byte{commandUpload}); err != nil {
 		dk.reportTransferProgress(req, 0, fileSize, pb.TransferStatus_TRANSFER_STATUS_FAILED, fmt.Sprintf("failed to send replication command: %v", err), true)
@@ -433,7 +461,7 @@ func (dk *DataKeeper) runReplication(jobKey string, req *pb.ReplicateRequest, fi
 	defer reporter.close()
 	reporter.report(0, pb.TransferStatus_TRANSFER_STATUS_RUNNING, "streaming data to the destination keeper", false)
 
-	written, err := copyExactWithBuffer(conn, file, fileSize, func(bytesTransferred int64) {
+	written, err := copyExactWithBuffer(transferCtx, conn, file, fileSize, func(bytesTransferred int64) {
 		reporter.maybeReport(bytesTransferred, pb.TransferStatus_TRANSFER_STATUS_RUNNING, "streaming data to the destination keeper")
 	})
 	if err != nil {
@@ -464,22 +492,75 @@ func (dk *DataKeeper) reportTransferProgress(req *pb.ReplicateRequest, bytesTran
 	}
 }
 
-func (dk *DataKeeper) startReplicationJob(jobKey string) bool {
+func (dk *DataKeeper) startTransfer(jobKey, fileName string, cancel context.CancelFunc) bool {
 	dk.replicationMu.Lock()
 	defer dk.replicationMu.Unlock()
 
-	if _, exists := dk.activeReplications[jobKey]; exists {
+	if _, exists := dk.activeTransfers[jobKey]; exists {
 		return false
 	}
 
-	dk.activeReplications[jobKey] = struct{}{}
+	dk.activeTransfers[jobKey] = transferHandle{
+		fileName: fileName,
+		cancel:   cancel,
+	}
+	if dk.transfersByFile[fileName] == nil {
+		dk.transfersByFile[fileName] = make(map[string]struct{})
+	}
+	dk.transfersByFile[fileName][jobKey] = struct{}{}
 	return true
 }
 
-func (dk *DataKeeper) finishReplicationJob(jobKey string) {
+func (dk *DataKeeper) finishTransfer(jobKey string) {
 	dk.replicationMu.Lock()
-	delete(dk.activeReplications, jobKey)
+	handle, exists := dk.activeTransfers[jobKey]
+	if exists {
+		delete(dk.activeTransfers, jobKey)
+		if fileTransfers := dk.transfersByFile[handle.fileName]; fileTransfers != nil {
+			delete(fileTransfers, jobKey)
+			if len(fileTransfers) == 0 {
+				delete(dk.transfersByFile, handle.fileName)
+			}
+		}
+	}
 	dk.replicationMu.Unlock()
+}
+
+func (dk *DataKeeper) cancelTransfersForFile(fileName string) int {
+	dk.replicationMu.Lock()
+	handles := dk.collectTransfersForFileLocked(fileName)
+	dk.replicationMu.Unlock()
+
+	for _, handle := range handles {
+		handle.cancel()
+	}
+	return len(handles)
+}
+
+func (dk *DataKeeper) cancelAllTransfers() int {
+	dk.replicationMu.Lock()
+	handles := make([]transferHandle, 0, len(dk.activeTransfers))
+	for _, handle := range dk.activeTransfers {
+		handles = append(handles, handle)
+	}
+	dk.replicationMu.Unlock()
+
+	for _, handle := range handles {
+		handle.cancel()
+	}
+	return len(handles)
+}
+
+func (dk *DataKeeper) collectTransfersForFileLocked(fileName string) []transferHandle {
+	transferIDs := dk.transfersByFile[fileName]
+	handles := make([]transferHandle, 0, len(transferIDs))
+	for transferID := range transferIDs {
+		handle, exists := dk.activeTransfers[transferID]
+		if exists {
+			handles = append(handles, handle)
+		}
+	}
+	return handles
 }
 
 func (dk *DataKeeper) StartRPCServer(port int32) {
@@ -547,7 +628,7 @@ func configureTCPConn(conn net.Conn) {
 	_ = tcpConn.SetWriteBuffer(socketBufferSize)
 }
 
-func copyExactWithBuffer(destination io.Writer, source io.Reader, totalBytes int64, onProgress func(int64)) (int64, error) {
+func copyExactWithBuffer(ctx context.Context, destination io.Writer, source io.Reader, totalBytes int64, onProgress func(int64)) (int64, error) {
 	if totalBytes < 0 {
 		return 0, fmt.Errorf("invalid byte count %d", totalBytes)
 	}
@@ -563,12 +644,19 @@ func copyExactWithBuffer(destination io.Writer, source io.Reader, totalBytes int
 	var written int64
 
 	for written < totalBytes {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+
 		readCount, readErr := limitedSource.Read(buffer)
 		if readCount > 0 {
 			writeCount, writeErr := destination.Write(buffer[:readCount])
 			written += int64(writeCount)
 			if onProgress != nil {
 				onProgress(written)
+			}
+			if err := ctx.Err(); err != nil {
+				return written, err
 			}
 			if writeErr != nil {
 				return written, writeErr
@@ -591,6 +679,25 @@ func copyExactWithBuffer(destination io.Writer, source io.Reader, totalBytes int
 	}
 
 	return written, nil
+}
+
+func closeTransferOnCancel(ctx context.Context, endpoint any) {
+	closer, ok := endpoint.(interface{ Close() error })
+	if !ok {
+		return
+	}
+
+	go func() {
+		<-ctx.Done()
+		_ = closer.Close()
+	}()
+}
+
+func removeIfExists(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 type transferReporter struct {
@@ -680,6 +787,13 @@ func (tr *transferReporter) close() {
 
 func replicationJobKey(fileName, destinationNodeID, transferID string) string {
 	return strings.Join([]string{fileName, destinationNodeID, transferID}, "\x00")
+}
+
+func incomingTransferKey(fileName, uploadID string) string {
+	if strings.TrimSpace(uploadID) == "" {
+		return "incoming:" + fileName
+	}
+	return "incoming:" + fileName + ":" + uploadID
 }
 
 func detectAdvertiseIPv4(masterAddr string) (string, error) {
