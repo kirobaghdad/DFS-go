@@ -49,8 +49,8 @@ type chunkResult struct {
 }
 
 func main() {
-	masterAddr := flag.String("master", "localhost:50051", "Master Tracker address")
-	httpPort := flag.String("port", "8081", "HTTP port for Client GUI")
+	masterAddr := flag.String("master", "localhost:56051", "Master Tracker address")
+	httpPort := flag.String("port", "18081", "HTTP port for Client GUI")
 	flag.Parse()
 
 	conn, err := grpc.NewClient(*masterAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))

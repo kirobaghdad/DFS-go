@@ -798,8 +798,8 @@ func maxInt(left, right int) int {
 }
 
 func main() {
-	grpcListenAddr := flag.String("grpc-listen", ":50051", "gRPC listen address for master tracker")
-	dashboardListenAddr := flag.String("dashboard-listen", ":8080", "HTTP dashboard listen address")
+	grpcListenAddr := flag.String("grpc-listen", ":56051", "gRPC listen address for master tracker")
+	dashboardListenAddr := flag.String("dashboard-listen", ":18080", "HTTP dashboard listen address")
 	flag.Parse()
 
 	listener, err := net.Listen("tcp", *grpcListenAddr)

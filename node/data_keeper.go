@@ -407,7 +407,20 @@ func readInt64(reader io.Reader) (int64, error) {
 	return value, err
 }
 
-func detectAdvertiseIPv4() (string, error) {
+func detectAdvertiseIPv4(masterAddr string) (string, error) {
+	host, _, err := net.SplitHostPort(masterAddr)
+	if err == nil && host != "" && host != "localhost" {
+		conn, dialErr := net.Dial("udp", net.JoinHostPort(host, "53"))
+		if dialErr == nil {
+			defer conn.Close()
+			if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+				if ip := localAddr.IP.To4(); ip != nil && !ip.IsLoopback() {
+					return ip.String(), nil
+				}
+			}
+		}
+	}
+
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "", err
@@ -441,13 +454,17 @@ func detectAdvertiseIPv4() (string, error) {
 		}
 	}
 
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return "127.0.0.1", nil
+	}
+
 	return "", fmt.Errorf("no non-loopback IPv4 found")
 }
 
 func main() {
 	id := flag.String("id", "node1", "Node ID")
-	tcpPort := flag.Int("port", 7000, "TCP port for file transfer")
-	masterAddr := flag.String("master", "localhost:50051", "Master Tracker address")
+	tcpPort := flag.Int("port", 17000, "TCP port for file transfer")
+	masterAddr := flag.String("master", "localhost:56051", "Master Tracker address")
 	advertiseIP := flag.String("advertise-ip", "", "Node IP/hostname advertised to master (auto-detected if empty)")
 	flag.Parse()
 
@@ -460,7 +477,7 @@ func main() {
 	masterClient := pb.NewMasterTrackerClient(conn)
 	ip := strings.TrimSpace(*advertiseIP)
 	if ip == "" {
-		detectedIP, err := detectAdvertiseIPv4()
+		detectedIP, err := detectAdvertiseIPv4(*masterAddr)
 		if err != nil {
 			log.Fatalf("failed to auto-detect node IP, set -advertise-ip explicitly: %v", err)
 		}

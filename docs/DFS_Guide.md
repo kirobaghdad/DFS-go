@@ -362,8 +362,8 @@ chmod +x run_system.sh
 
 Then open:
 
-- Dashboard: `http://localhost:8080`
-- Client UI: `http://localhost:8081`
+- Dashboard: `http://localhost:18080`
+- Client UI: `http://localhost:18081`
 
 This is the fastest way to verify:
 
@@ -393,35 +393,37 @@ Make sure both devices:
 2. Can ping each other.
 3. Have Go installed.
 4. Allow these ports through the firewall:
-   - `50051` for master gRPC
-   - `8080` for dashboard
-   - `8081` for client UI
-   - `7001`, `7002`, `7003` for keeper TCP file transfer
-   - `8001`, `8002`, `8003` for keeper gRPC control (`port + 1000`)
+   - `56051` for master gRPC
+   - `18080` for dashboard
+   - `18081` for client UI
+   - `17001`, `17002`, `17003` for keeper TCP file transfer
+   - `18001`, `18002`, `18003` for keeper gRPC control (`port + 1000`)
 
-Replace the placeholders:
+Only Device B needs to know the LAN IP of Device A, because Device B must reach the master over the network.
 
-- `<DEVICE_A_IP>` with the LAN IP of Device A
-- `<DEVICE_B_IP>` with the LAN IP of Device B
+So in the commands below:
+
+- On **Device A**, use `localhost`
+- On **Device B**, replace `<DEVICE_A_IP>` with the LAN IP of Device A
 
 #### Device A commands
 
 Start the master:
 
 ```bash
-go run ./master/master_tracker.go -grpc-listen :50051 -dashboard-listen :8080
+go run ./master/master_tracker.go -grpc-listen :56051 -dashboard-listen :18080
 ```
 
 In a second terminal on Device A, start node1:
 
 ```bash
-go run ./node/data_keeper.go -id node1 -port 7001 -master <DEVICE_A_IP>:50051 -advertise-ip <DEVICE_A_IP>
+go run ./node/data_keeper.go -id node1 -port 17001 -master localhost:56051
 ```
 
 In a third terminal on Device A, start the client UI:
 
 ```bash
-go run ./client/client.go -master <DEVICE_A_IP>:50051 -port 8081
+go run ./client/client.go -master localhost:56051 -port 18081
 ```
 
 #### Device B commands
@@ -429,21 +431,23 @@ go run ./client/client.go -master <DEVICE_A_IP>:50051 -port 8081
 In the first terminal on Device B, start node2:
 
 ```bash
-go run ./node/data_keeper.go -id node2 -port 7002 -master <DEVICE_A_IP>:50051 -advertise-ip <DEVICE_B_IP>
+go run ./node/data_keeper.go -id node2 -port 17002 -master <DEVICE_A_IP>:56051
 ```
 
 In the second terminal on Device B, start node3:
 
 ```bash
-go run ./node/data_keeper.go -id node3 -port 7003 -master <DEVICE_A_IP>:50051 -advertise-ip <DEVICE_B_IP>
+go run ./node/data_keeper.go -id node3 -port 17003 -master <DEVICE_A_IP>:56051
 ```
+
+The node now infers its advertised IP automatically, so these commands do not need `-advertise-ip`.
 
 #### What to open in the browser
 
 Open these from Device A:
 
-- Dashboard: `http://<DEVICE_A_IP>:8080`
-- Client UI: `http://<DEVICE_A_IP>:8081`
+- Dashboard: `http://localhost:18080`
+- Client UI: `http://localhost:18081`
 
 #### What to test
 
