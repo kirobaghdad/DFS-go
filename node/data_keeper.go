@@ -799,15 +799,19 @@ func incomingTransferKey(fileName, uploadID string) string {
 func detectAdvertiseIPv4(masterAddr string) (string, error) {
 	host, _, err := net.SplitHostPort(masterAddr)
 	if err == nil && host != "" && host != "localhost" {
-		conn, dialErr := net.Dial("udp", net.JoinHostPort(host, "53"))
-		if dialErr == nil {
-			defer conn.Close()
-			if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
-				if ip := localAddr.IP.To4(); ip != nil && !ip.IsLoopback() {
-					return ip.String(), nil
-				}
-			}
+		if ip, routeErr := detectOutboundIPv4ToHost(host); routeErr == nil {
+			return ip, nil
 		}
+	}
+
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		if ip, routeErr := detectDefaultRouteIPv4(); routeErr == nil {
+			return ip, nil
+		}
+	}
+
+	if ip, scanErr := detectBestInterfaceIPv4(); scanErr == nil {
+		return ip, nil
 	}
 
 	ifaces, err := net.Interfaces()
@@ -848,6 +852,113 @@ func detectAdvertiseIPv4(masterAddr string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no non-loopback IPv4 found")
+}
+
+func detectOutboundIPv4ToHost(host string) (string, error) {
+	conn, err := net.Dial("udp", net.JoinHostPort(host, "53"))
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return "", errors.New("failed to inspect local UDP address")
+	}
+
+	ip := localAddr.IP.To4()
+	if ip == nil || ip.IsLoopback() {
+		return "", errors.New("no non-loopback IPv4 found for route")
+	}
+
+	return ip.String(), nil
+}
+
+func detectDefaultRouteIPv4() (string, error) {
+	probes := []string{"8.8.8.8", "1.1.1.1", "9.9.9.9"}
+	for _, probe := range probes {
+		if ip, err := detectOutboundIPv4ToHost(probe); err == nil {
+			return ip, nil
+		}
+	}
+
+	return "", errors.New("default route probe failed")
+}
+
+func detectBestInterfaceIPv4() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+
+	bestScore := -1 << 30
+	bestIP := ""
+
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ip := ipv4FromAddr(addr)
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+
+			score := scoreAdvertiseCandidate(iface, ip)
+			if score > bestScore {
+				bestScore = score
+				bestIP = ip.String()
+			}
+		}
+	}
+
+	if bestIP == "" {
+		return "", errors.New("no suitable IPv4 found across active interfaces")
+	}
+
+	return bestIP, nil
+}
+
+func ipv4FromAddr(addr net.Addr) net.IP {
+	switch value := addr.(type) {
+	case *net.IPNet:
+		return value.IP.To4()
+	case *net.IPAddr:
+		return value.IP.To4()
+	default:
+		return nil
+	}
+}
+
+func scoreAdvertiseCandidate(iface net.Interface, ip net.IP) int {
+	score := 0
+	name := strings.ToLower(iface.Name)
+
+	if ip.IsPrivate() {
+		score += 100
+	}
+	if iface.Flags&net.FlagBroadcast != 0 {
+		score += 20
+	}
+	if iface.Flags&net.FlagPointToPoint == 0 {
+		score += 10
+	}
+
+	virtualHints := []string{"docker", "br-", "veth", "virbr", "vmnet", "vboxnet", "tailscale", "tun", "wg", "zt"}
+	for _, hint := range virtualHints {
+		if strings.Contains(name, hint) {
+			score -= 80
+			break
+		}
+	}
+
+	return score
 }
 
 func main() {

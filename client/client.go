@@ -52,7 +52,7 @@ type chunkResult struct {
 
 func main() {
 	masterAddr := flag.String("master", "localhost:56051", "Master Tracker address")
-	httpPort := flag.String("port", "18081", "HTTP port for Client GUI")
+	httpPort := flag.String("port", "18081", "HTTP listen port or address for Client GUI")
 	flag.Parse()
 
 	conn, err := grpc.NewClient(*masterAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -62,6 +62,7 @@ func main() {
 	defer conn.Close()
 
 	app := &ClientApp{master: pb.NewMasterTrackerClient(conn)}
+	listenAddr := normalizeHTTPListenAddr(*httpPort)
 
 	http.HandleFunc("/", app.ServeGUI)
 	http.HandleFunc("/api/upload", app.HandleUpload)
@@ -73,8 +74,8 @@ func main() {
 		http.ServeFile(w, r, "nexus.jpg")
 	})
 
-	log.Printf("Client GUI available at http://localhost:%s", *httpPort)
-	if err := http.ListenAndServe(":"+*httpPort, nil); err != nil {
+	log.Printf("Client GUI listening on %s and using master %s", listenAddr, *masterAddr)
+	if err := http.ListenAndServe(listenAddr, nil); err != nil {
 		log.Fatalf("HTTP server failed: %v", err)
 	}
 }
@@ -425,4 +426,15 @@ func grpcCodeToHTTP(code codes.Code) int {
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+func normalizeHTTPListenAddr(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ":18081"
+	}
+	if strings.Contains(trimmed, ":") {
+		return trimmed
+	}
+	return ":" + trimmed
 }
